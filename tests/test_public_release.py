@@ -48,8 +48,9 @@ class NetworkTests(unittest.TestCase):
         local=subprocess.CompletedProcess([],0,'eth0 UP 198.51.100.9/24\n','')
         with patch.dict(os.environ,{'RL_LAB_NETWORK':'192.0.2.64/26'}), \
              patch.object(tool.subprocess,'run',return_value=local), \
-             patch.object(tool,'ssh',side_effect=AssertionError('SSH must be gated')):
-            self.assertFalse(tool.preflight('example.invalid',None,verbose=False)[0])
+             patch.object(tool,'ssh',side_effect=AssertionError('SSH must be gated')), \
+             patch.object(tool,'open_master',side_effect=AssertionError('Authentication must be gated')):
+            self.assertFalse(tool.preflight('example.invalid',None,verbose=False,auth_setup=True)[0])
 
     def test_unattended_scope_failure_stops_before_remote_checks(self):
         with tempfile.TemporaryDirectory() as temp:

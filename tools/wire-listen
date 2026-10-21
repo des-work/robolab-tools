@@ -145,7 +145,7 @@ def open_master(target):
     return True
 
 
-def preflight(target, iface, verbose=True):
+def preflight(target, iface, verbose=True, *, auth_setup=False):
     ok, fail, warn = [], [], []
 
     mine = ""
@@ -164,6 +164,8 @@ def preflight(target, iface, verbose=True):
     if not on_lab_network(mine):
         if verbose:
             print("FAIL: configure RL_LAB_NETWORK and join the authorized lab network")
+        return False, iface
+    if auth_setup and not open_master(target):
         return False, iface
     probe = ssh(target, "echo __OK__")
     if probe and probe.returncode == 0 and "__OK__" in probe.stdout:
@@ -443,9 +445,7 @@ def main():
     print("  WIRE-LISTEN - watch the cable between a PC and a robot")
     print("=" * 62)
     print()
-    if args.ask_password and not open_master(target):
-        return 2
-    ok, iface = preflight(target, args.iface)
+    ok, iface = preflight(target, args.iface, auth_setup=args.ask_password)
     print()
     if args.check:
         print("  READY." if ok else "  NOT READY. Nothing was started.")
