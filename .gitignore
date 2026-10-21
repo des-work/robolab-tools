@@ -1,0 +1,21 @@
+# The real robot table. NEVER COMMIT THIS.
+#
+# It is the only place the link between a robot and its hardware address
+# lives outside the GA's records, and a repository is far more durable and
+# far easier to leak than a file on one laptop.
+robots.json
+*robots.json
+!robots.example.json
+
+# Captures and run logs. These contain hardware addresses by design -
+# an ARP reply carries one - and they are evidence, not source.
+*.pcap
+*.pcapng
+scans/
+zeek-*/
+*.log
+
+# Local
+__pycache__/
+*.pyc
+.DS_Store

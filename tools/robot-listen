@@ -1,0 +1,872 @@
+#!/usr/bin/env python3
+"""robot-listen - watch one robot's traffic live, while you use it.
+
+    robot-listen                 pick a robot, then listen
+    robot-listen --robot Robot-A   skip the picker
+    robot-listen --all-robots    every robot at once, still filtered
+    robot-listen --everything    UNFILTERED, whole bridge (gated)
+    robot-listen --check         verify prerequisites and exit
+
+WHICH MODE
+----------
+    --robot        one robot. The default, and what you want when you are
+                   watching a specific machine being used.
+    --all-robots   all of them. Answers "is a single-robot filter hiding
+                   traffic?" without recording anything belonging to anyone
+                   else - it is still a filter, just a wider one.
+    --everything   the whole bridge, including devices that are not ours.
+                   Requires RL_WIDE_OK=i-have-authorisation, because that is a
+                   decision for a person rather than a flag.
+
+                   It automatically excludes the SSH session carrying the
+                   capture. Without that the stream records itself: every
+                   captured packet is sent back over that session, generating
+                   more packets to capture. On the first unfiltered run the top
+                   talker was our own capture.
+
+WHAT THIS IS FOR, AND WHY IT IS NOT robot-round-up
+---------------------------------------------------
+round-up captures a controlled boot and analyses it afterwards. This is the
+opposite shape: it shows traffic AS IT HAPPENS, so a person can do something to
+the robot and watch what the network does a second later.
+
+That makes it the first tool in this project aimed at a MODE rather than a
+state - what changes when the cloud AI is actually used.
+
+THE FEATURE THAT MATTERS IS NOT THE LIVE VIEW
+---------------------------------------------
+It is the MARK key. Type anything and press enter and it lands in the timeline,
+timestamped to the same clock as the packets.
+
+Day 6 established that a network record is not interpretable without an operator
+record beside it - we could not say whether a silent robot was off or simply
+quiet, because nobody had written down what was done and when. A tool that
+watches traffic while a person operates the robot is exactly where that gap
+opens, so the operator log is built in rather than left to a clipboard.
+
+SCOPE
+-----
+Passive. Capture happens at the access point we administer, filtered to ONE
+hardware address. Management queries and capture transport use SSH; robot discovery probes and DNS lookups are not generated. Names are
+learned by watching the robot's own DNS answers go past - never by us asking.
+"""
+
+import argparse
+from rl_network import on_lab_network
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+AP_MAC_PREFIX = os.environ.get("AP_MAC_PREFIX", "94:83:c4")
+OUTDIR = Path(os.environ.get("OUTDIR", Path.home() / "Documents/robolab-evidence/scans"))
+
+# The robot table is NOT in this file. It lives in a local config that is never
+# committed, because a hardware address is the one thing this project does not
+# publish - and a repository is far more durable, and far easier to leak, than a
+# file on one laptop.
+#
+#   ~/.config/robolab/robots.json      (or $ROBOLAB_ROBOTS)
+#
+# See robots.example.json in the repository for the shape, and ask the GA for
+# the real one. That hand-off is the control that keeps the identifiers inside
+# the team; it is not bureaucracy and it takes about thirty seconds.
+ROBOTS_FILE = Path(os.environ.get(
+    "ROBOLAB_ROBOTS", Path.home() / ".config/robolab/robots.json"))
+
+
+def load_robots():
+    if not ROBOTS_FILE.is_file():
+        sys.exit(
+            f"No robot table at {ROBOTS_FILE}\n\n"
+            "  This file holds the robots' hardware addresses. It is deliberately\n"
+            "  not in the repository - see robots.example.json for the shape, and\n"
+            "  ask the GA for the real one.\n\n"
+            "    mkdir -p ~/.config/robolab\n"
+            "    # put robots.json there, then:\n"
+            "    chmod 600 ~/.config/robolab/robots.json\n")
+    try:
+        raw = json.loads(ROBOTS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        sys.exit(f"{ROBOTS_FILE}: not readable as JSON ({e})")
+    out = []
+    for r in raw:
+        try:
+            mac = r["mac"].strip().lower()
+            if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+                sys.exit(f"{ROBOTS_FILE}: {r.get('name')!r} has a bad hardware "
+                         f"address: {r.get('mac')!r}")
+            out.append((r["name"], mac, r.get("note", "")))
+        except (KeyError, TypeError):
+            sys.exit(f"{ROBOTS_FILE}: every entry needs 'name' and 'mac'")
+    if not out:
+        sys.exit(f"{ROBOTS_FILE}: no robots listed")
+    return out
+
+
+ROBOTS = None   # loaded in main(), so --help works without the config
+
+# What a destination means, once we know its name. Substring match on the name
+# the robot itself looked up - we never resolve anything.
+MEANING = [
+    ("gpt-proxy.unitree.com",      "AI",      "vendor LLM proxy"),
+    ("openspeech.bytedance.com",   "AI",      "ByteDance speech"),
+    ("nls-gateway",                "AI",      "Alibaba speech gateway"),
+    ("aliyuncsslbintl",            "CONTROL", "MQTT load balancer"),
+    ("global-robot-mqtt",          "CONTROL", "vendor MQTT broker"),
+    ("docker-images-registry",     "UPDATE",  "container registry"),
+    ("dockerauth",                 "UPDATE",  "registry auth"),
+    ("ntp.",                       "TIME",    "time sync"),
+]
+COLOUR = {"AI": "\033[38;5;213m", "CONTROL": "\033[38;5;220m", "UPDATE": "\033[38;5;208m",
+          "TIME": "\033[38;5;245m", "DNS": "\033[38;5;110m", "DHCP": "\033[38;5;245m",
+          "MARK": "\033[38;5;120m", "?": "\033[38;5;252m"}
+DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
+
+_IPV4 = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+# A DNS response carries the ANSWERS but not the question, so the name and the
+# addresses have to be joined by transaction id - the same discipline as joining
+# Zeek logs on `uid` rather than on an address.
+#   request :  53612+ [1au] A? gpt-proxy.unitree.com. (39)
+#   response:  53612 1/0/1 A 8.222.78.102 (55)
+_DNS_REQ = re.compile(r":\s+(\d+)\+.*?\b(?:A|AAAA)\?\s+([A-Za-z0-9._-]+?)\.?\s")
+_DNS_RESP = re.compile(r":\s+(\d+)\s+\d+/\d+/\d+\s")
+_DNS_A = re.compile(r"\bA\s+(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+# tcpdump writes an endpoint as ADDRESS.PORT, so the only safe test for "this
+# went to port 53" is four dotted octets followed by the port. A plain substring
+# search for ".53" also matches a HOST whose address ends in .53 and a packet
+# whose LENGTH is 53 - both were misclassified as DNS before this existed.
+_PORT_DNS = re.compile(r"\b(?:\d{1,3}\.){4}(?:53|5353)\b")
+_PORT_DHCP = re.compile(r"\b(?:\d{1,3}\.){4}6[78]\b")
+
+# tcpdump writes "IP src.port > dst.port:" for IP, and a different shape for ARP.
+# Both endpoints are shown rather than guessing which one is "the peer" - an
+# earlier version picked the first non-lab address and so labelled the robot's
+# OWN internal address as its peer, in the one packet exchange that mattered.
+# With TZ=UTC and -tttt, tcpdump prints an absolute UTC timestamp per packet.
+# That matters more here than anywhere else in the project: the whole purpose of
+# this tool is lining up what a person did against what the network did, and a
+# processing-time clock puts a whole buffered burst at one instant that never
+# happened. Marks use the same UTC clock, so the two are directly comparable.
+_ABS_TS = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)")
+
+_ENDPOINTS = re.compile(r"\bIP6?\s+(\S+?)\s+>\s+(\S+?):")
+
+# ARP has its own shape and reversed sense: in "who-has TARGET tell SENDER" the
+# SENDER is asking. Reading the addresses left-to-right gets the direction
+# backwards - and ARP is the exact packet type that produced the finding of
+# 2026-09-30, so this is worth parsing properly rather than approximately.
+_ARP_REQ = re.compile(r"ARP, Request who-has (\S+?) tell (\S+?)[,\s]")
+_ARP_REP = re.compile(r"ARP, Reply (\S+?) is-at ([0-9a-f:]+)", re.I)
+
+
+def _label_match(needle: str, name: str) -> bool:
+    """Does `needle` identify `name`?
+
+    Two kinds of needle, and treating them alike breaks one or the other:
+
+      * a DOTTED needle is a name or a name prefix, so it must land on a label
+        boundary. Plain substring matching let `ntp.` match `myntp.corp.example`,
+        which is somebody else's host.
+      * an UNDOTTED needle is a distinguishing word that lives INSIDE a label -
+        `docker-images-registry` sits in the middle of
+        `unitree-docker-images-registry.cn-hangzhou.cr.aliyuncs.com`. Requiring a
+        boundary for those stopped the update channel being recognised at all,
+        which the regression caught.
+    """
+    if not name:
+        return False
+    if "." in needle:
+        return name.startswith(needle) or ("." + needle) in name
+    return needle in name
+
+
+def iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def stamp():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+
+
+def colour_ok():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(text, key):
+    return f"{COLOUR.get(key, '')}{text}{OFF}" if colour_ok() else text
+
+
+def find_ap():
+    try:
+        out = subprocess.run(["ip", "neighbor", "show"], capture_output=True,
+                             text=True, timeout=5,
+                             stdin=subprocess.DEVNULL).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if AP_MAC_PREFIX.lower() in line.lower():
+            return line.split()[0]
+    return None
+
+
+def my_ip():
+    try:
+        out = subprocess.run(["ip", "-4", "-br", "address", "show", "scope", "global"],
+                             capture_output=True, text=True, timeout=5,
+                             stdin=subprocess.DEVNULL).stdout
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and not parts[0].startswith(("docker", "virbr", "lo")):
+            return parts[-1]
+    return ""
+
+
+def associated(ap):
+    """Which hardware addresses the AP lists in its station table right now.
+
+    Read from the AP's own station table. Passive - the AP reporting on
+    itself, nothing probed. A listed entry may linger after a device powers
+    down, so this does not establish that the robot is powered or transmitting.
+
+    This check helps distinguish an address missing from the AP table from an
+    address listed there. Neither result proves the robot's power state.
+    """
+    if not ap:
+        return None
+    cmd = ('for i in $(iw dev 2>/dev/null | awk "/Interface/{print \\$2}"); do '
+           'iw dev "$i" station dump 2>/dev/null | awk "/^Station/{print \\$2}"; done')
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                            f"root@{ap}", cmd], capture_output=True, text=True,
+                           timeout=15, stdin=subprocess.DEVNULL)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return {l.strip().lower() for l in r.stdout.splitlines() if l.strip()}
+
+
+def preflight(verbose=True):
+    ok, fail, warn = [], [], []
+
+    ip = my_ip()
+    (ok if on_lab_network(ip) else fail).append(
+        f"lab segment: {ip or 'no address'}")
+
+    ap = None
+    if on_lab_network(ip):
+        ap = find_ap()
+        # The prefix is a vendor prefix, not a unique id, and at least one of us
+        # owns the same access point model at home. Off-segment it WILL match
+        # something that is not the lab, so the lookup is gated on the segment.
+        (ok if ap else fail).append(f"access point: {ap or 'not in neighbour cache'}")
+    else:
+        fail.append("access point: not looked for (not on the lab segment)")
+
+    if ap:
+        # The host key BEFORE the auth test. BatchMode does not ASK the host-key
+        # question, it FAILS it - so an access point that merely moved to a new
+        # address produces "Host key verification failed", which the auth test
+        # below then reports as a key problem. It is not. The key is fine and
+        # the address changed. ap-hostkey tells those apart, and refuses outright
+        # when the key at that address is one we have never seen.
+        hk = Path(__file__).resolve().parent / "ap-hostkey"
+        if hk.exists():
+            h = subprocess.run([str(hk), ap], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL)
+            out = (h.stdout + h.stderr).strip()
+            if h.returncode == 3:
+                warn.append("access point MOVED - same host key, now recorded")
+            elif h.returncode == 4:
+                fail.append("access point host key is UNRECOGNISED - refusing")
+                for line in out.splitlines()[:4]:
+                    warn.append(line.strip())
+                ap = None
+            elif h.returncode == 5:
+                warn.append(f"could not read a host key from {ap}")
+
+    if ap:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                            f"root@{ap}", "command -v tcpdump"],
+                           capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+        (ok if r.returncode == 0 and r.stdout.strip() else fail).append(
+            "tcpdump on the access point (key-based ssh)")
+
+    (ok if shutil.which("tcpdump") else fail).append("tcpdump locally")
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    (ok if os.access(OUTDIR, os.W_OK) else fail).append(f"writable: {OUTDIR}")
+
+    # A live session writes a pcap for as long as it runs. Checking space up
+    # front is cheaper than discovering it at minute forty - and the student
+    # guide states that --check covers this, so it has to.
+    free_mb = shutil.disk_usage(OUTDIR).free // (1024 * 1024)
+    (ok if free_mb >= 1000 else fail).append(
+        f"free space {free_mb} MB (want 1000+)")
+
+    if os.environ.get("RL_OPERATOR"):
+        ok.append(f"operator: {os.environ['RL_OPERATOR']}")
+    else:
+        warn.append("RL_OPERATOR unset - this record cannot say who ran it")
+
+    if verbose:
+        for s in ok:
+            print(f"  ok    {s}")
+        for s in fail:
+            print(f"  FAIL  {s}")
+        for s in warn:
+            print(f"  warn  {s}")
+    return (not fail), ap
+
+
+class Listener:
+    def __init__(self, label, mac, ap, outdir, filter_=None, macs=None):
+        self.label, self.mac, self.ap = label, mac, ap
+        # `macs` is every address this run covers; `mac` stays the primary
+        # subject so the association check still means something.
+        self.macs = macs or ([mac] if mac else [])
+        self.filter = filter_ if filter_ is not None else (
+            f"ether host {mac}" if mac else "")
+        self.run = stamp()
+        self.dir = outdir / f"{self.run}-robot-listen-{label}"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.log = self.dir / "00-TIMELINE.txt"
+        self.pcap = self.dir / "01-capture.pcap"
+        self.names = {}          # ip -> name, learned from the robot's own DNS
+        self._pending = {}       # dns txid -> query name, awaiting its answer
+        self.counts = {}         # label -> packets
+        self.t0 = time.time()
+        self.stop = threading.Event()
+        self.rc = None
+        self._wlock = threading.Lock()
+        self.assoc_start = None   # did the AP list the subject address at start?
+
+    def w(self, line):
+        # The packet loop and the mark reader are different threads writing the
+        # same file. Marks are the reason this tool exists; a mark interleaved
+        # into the middle of a packet line would corrupt the one record we most
+        # need to be able to read back.
+        with self._wlock:
+            with open(self.log, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+
+    def header(self):
+        self.w(f"# ############################################################")
+        self.w(f"# GA ONLY - NOT SHAREABLE")
+        self.w(f"#")
+        self.w(f"# This file contains hardware addresses - in the header below AND")
+        self.w(f"# inside logged packet text, because an ARP reply carries one.")
+        self.w(f"#")
+        self.w(f"# An earlier version of this header claimed the address was")
+        self.w(f"# withheld. It was not. A header that says a file is safe when it")
+        self.w(f"# is not is worse than no header at all, so this one says plainly")
+        self.w(f"# what the file holds.")
+        self.w(f"# ############################################################")
+        self.w(f"#")
+        self.w(f"# RoboLab - robot-listen")
+        self.w(f"# run at:    {iso()}")
+        self.w(f"# operator:  {os.environ.get('RL_OPERATOR', 'unset')}")
+        self.w(f"# subject:   {self.label}")
+        for m in self.macs:
+            self.w(f"# covers:    {m}")
+        self.w(f"# filter:    {self.filter or '(none - WHOLE BRIDGE)'}")
+        self.w(f"# ap:        {self.ap}  (found by hardware address prefix)")
+        self.w(f"# method:    live capture at the AP's client bridge, streamed here.")
+        self.w(f"#            PASSIVE - nothing scanned, probed or resolved by us.")
+        self.w(f"#            Names below were learned by watching the robot's own")
+        self.w(f"#            DNS answers, never by us asking.")
+        self.w("")
+
+    def classify(self, ip, text):
+        """What is this, in one word, based only on what we have observed."""
+        name = self.names.get(ip, "")
+        # From the PORT, never from the text: a host legitimately NAMED
+        # something like dhcp-server.example.com was being classified as DHCP
+        # while talking on 443.
+        if _PORT_DHCP.search(text):
+            return "DHCP", name
+        if _PORT_DNS.search(text):
+            return "DNS", name
+        for needle, kind, _what in MEANING:
+            if _label_match(needle.lower(), name.lower()):
+                return kind, name
+        return "?", name
+
+    def endpoints(self, line):
+        """Return (src, dst, address-to-look-up).
+
+        Shows both ends. Which one is "the robot" is not always knowable from a
+        line - it holds more than one address, and one of them turned out to be
+        on a subnet we had documented as unreachable - so the tool states what it
+        saw instead of inferring a direction it cannot verify.
+        """
+        a = _ARP_REQ.search(line)
+        if a:
+            target, sender = a.group(1), a.group(2)
+            return f"{sender} (asking)", f"who-has {target}", target
+        a = _ARP_REP.search(line)
+        if a:
+            return f"{a.group(1)} (answering)", "", a.group(1)
+
+        m = _ENDPOINTS.search(line)
+        if m:
+            src, dst = m.group(1), m.group(2)
+            # Look up whichever end we already have a name for; failing that the
+            # destination, which is what a name usually belongs to.
+            d_ip = ".".join(dst.split(".")[:4])
+            s_ip = ".".join(src.split(".")[:4])
+            look = d_ip if d_ip in self.names else (s_ip if s_ip in self.names else d_ip)
+            return src, dst, look
+        ips = _IPV4.findall(line)
+        if not ips:
+            return "", "", ""
+        return ips[0], (ips[1] if len(ips) > 1 else ""), ips[-1]
+
+    def learn(self, line):
+        """Build an ip -> name map from DNS traffic we watched go past.
+
+        Never by resolving anything ourselves. If the robot did not ask, we do
+        not know the name, and the display says so rather than inventing one.
+        """
+        req = _DNS_REQ.search(line)
+        if req:
+            # Bounded, but by evicting the OLDEST rather than clearing. A burst
+            # of lookups arriving at the wrong moment used to discard every
+            # in-flight query at once, losing the names for all of them.
+            while len(self._pending) > 4096:
+                self._pending.pop(next(iter(self._pending)))
+            self._pending[req.group(1)] = req.group(2)
+            return
+        resp = _DNS_RESP.search(line)
+        if not resp:
+            return
+        qname = self._pending.get(resp.group(1))
+        if not qname:
+            return
+        for m in _DNS_A.finditer(line):
+            self.names.setdefault(m.group(1), qname)
+
+    def mark_reader(self):
+        """Operator markers on stdin. This is the point of the tool."""
+        while not self.stop.is_set():
+            r, _, _ = select.select([sys.stdin], [], [], 0.4)
+            if not r:
+                continue
+            text = sys.stdin.readline()
+            if not text:
+                break
+            text = text.strip()
+            if not text:
+                text = "(unlabelled mark)"
+            t = iso()
+            self.w(f"{t}  >>> MARK: {text}")
+            el = time.time() - self.t0
+            print(f"  {c('MARK', 'MARK')}  {el:7.1f}s  {BOLD}{text}{OFF}")
+
+    def listen(self):
+        flt = self.filter
+        remote = (f"tcpdump -i br-lan -U -n -l -s 0 -w - \"{flt}\"")
+        # Two consumers of one stream: a file (evidence) and a decoder (display).
+        # tee keeps them honest - what is shown is what was written.
+        cmd = (f"ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 "
+               f"root@{self.ap} '{remote}' | tee {shlex.quote(str(self.pcap))} | "
+               f"TZ=UTC tcpdump -r - -n -l -tttt")  # -tttt+TZ=UTC: absolute UTC per packet.
+               # NOT -q: it strips the DNS detail the classifier parses.
+        attempt = 0
+        while not self.stop.is_set():
+            attempt += 1
+            if attempt > 1:
+                msg = f"capture stream ended - reconnecting (attempt {attempt})"
+                self.w(f"{iso()}  >>> {msg}")
+                print(f"  {c('RECONN', 'MARK')}  {msg}")
+                time.sleep(2)
+            if not self._segment(cmd):
+                break
+        self.stop.set()
+
+    def _segment(self, cmd):
+        """One connection's worth of stream. Returns True if it is worth retrying.
+
+        A long session WILL lose its ssh connection eventually. Ending silently
+        at minute forty, with the operator still marking actions into a log that
+        has stopped recording packets, would be the worst possible failure for
+        this tool - the record would look complete and be wrong.
+        """
+        # stdin=DEVNULL is NOT optional. Popen inherits stdin by default, and the
+        # ssh in this pipeline will happily read from it - swallowing the
+        # operator's marks, which are the entire reason this tool exists. Seen
+        # during testing: a mark typed after a reconnect never reached the log.
+        proc = subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.PIPE,
+                                stderr=open(self.dir / "capture-errors.txt", "a"),
+                                stdin=subprocess.DEVNULL,
+                                text=True, bufsize=1)
+        got_any = False
+        try:
+            for line in proc.stdout:
+                if self.stop.is_set():
+                    break
+                line = line.rstrip("\n")
+                if not line or line.startswith("reading from"):
+                    continue
+                self.learn(line)
+                src, dst, lookup = self.endpoints(line)
+                kind, name = self.classify(lookup, line)
+                self.counts[kind] = self.counts.get(kind, 0) + 1
+                self.counts["_n"] = self.counts.get("_n", 0) + 1
+                el = time.time() - self.t0
+                pair = f"{src} > {dst}" if src or dst else "-"
+                mt = _ABS_TS.match(line)
+                when = (mt.group(1).replace(" ", "T") + "Z") if mt else iso()
+                self.w(f"{when}  {kind:<8} {pair:<44} {name or '-':<46} {line[:200]}")
+                tail = (f"  {DIM}{name}{OFF}" if colour_ok() else f"  {name}") if name else ""
+                print(f"  {c(f'{kind:<7}', kind)} {el:7.1f}s  {pair:<42}{tail}")
+                got_any = True
+                # Cheap disk guard. A capture that fills the disk takes the
+                # evidence tree down with it.
+                if self.counts.get("_n", 0) % 500 == 0:
+                    if shutil.disk_usage(self.dir).free < 500 * 1024 * 1024:
+                        self.w(f"{iso()}  >>> STOPPING - less than 500 MB free")
+                        print("  STOPPING - less than 500 MB free")
+                        self.stop.set()
+                        break
+        except KeyboardInterrupt:
+            self.stop.set()
+        finally:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            self.rc = proc.poll()
+        # Retry only if we were actually running and the operator has not stopped.
+        return got_any and not self.stop.is_set()
+
+    def verdict(self):
+        """Did the capture actually run?
+
+        THE WHOLE POINT. A failed capture and a silent robot produce the same
+        empty output, and this project has already lost a day to exactly that
+        confusion — a robot that sent nothing could not be told apart from a
+        capture that never started. A tool that cannot distinguish them is worse
+        than no tool, because it produces a confident wrong answer.
+        """
+        err = ""
+        try:
+            err = (self.dir / "capture-errors.txt").read_text(encoding="utf-8")
+        except OSError:
+            pass
+        # 24 bytes is a pcap file header and no packets at all.
+        size = self.pcap.stat().st_size if self.pcap.exists() else 0
+        listening = "listening on" in err
+        # These three are normal: two startup banners, and the one tcpdump emits
+        # when it is interrupted on the way out. Reporting them as errors under a
+        # SILENT verdict made a correct run look broken.
+        benign = ("listening on", "reading from", "Interrupted system call")
+        broken = [l for l in err.splitlines()
+                  if l.strip() and not any(b in l for b in benign)]
+
+        if not listening or size < 24:
+            return ("FAILED",
+                    "The capture never started. Nothing below is evidence about "
+                    "the robot.", broken)
+
+        if not [k for k in self.counts if k != "_n"]:
+            if not self.mac:
+                return ("NO PACKETS",
+                        "The capture ran and recorded no packets matching the "
+                        "selected filter. This does not establish which robots "
+                        "were powered or active.", broken)
+            # The AP table is one observation, not proof of physical power.
+            still = associated(self.ap)
+            here = None
+            if still is not None and self.mac:
+                here = self.mac.lower() in still
+            if self.assoc_start is False or here is False:
+                return ("NOT LISTED",
+                        "The capture ran and recorded no packets for this "
+                        "address. The AP did not list it at the start or end "
+                        "check (possibly both). This does not establish the "
+                        "robot's power state or explain the missing traffic.",
+                        broken)
+            if self.assoc_start is None and here is None:
+                return ("UNKNOWN",
+                        "The capture ran and recorded no packets for this "
+                        "address. The AP station table could not be read at "
+                        "either check; presence and power state are unknown.",
+                        broken)
+            return ("NO PACKETS",
+                    "The capture ran and recorded no packets for this address. "
+                    "The AP listed the address at least once, but a station "
+                    "entry can linger after shutdown. The robot's power state "
+                    "and activity cannot be inferred from this alone.", broken)
+        return ("OK", "", broken)
+
+    def summary(self):
+        state, why, broken = self.verdict()
+
+        self.w("")
+        self.w("## did the capture run?")
+        self.w(f"   {state}")
+        if why:
+            self.w(f"   {why}")
+        for b in broken:
+            self.w(f"   stderr: {b}")
+        self.w("")
+        self.w("## what was seen, by kind")
+        for k, v in sorted(self.counts.items(), key=lambda x: -x[1]):
+            if k == "_n":
+                continue
+            self.w(f"   {k:<8} {v}")
+        self.w("")
+        self.w("## names the robot resolved during this session")
+        for ip, n in sorted(self.names.items(), key=lambda x: x[1]):
+            self.w(f"   {n:<52} {ip}")
+        self.w("")
+        self.w("## what this session does NOT establish")
+        self.w("   - that a marked action CAUSED the traffic near it. The marks and")
+        self.w("     the packets share a clock; that is correlation, not causation.")
+        self.w("   - that AI traffic here was a response to the operator. These")
+        self.w("     robots reach their cloud AI endpoints at STARTUP too - 400 of")
+        self.w("     1198 packets in a plain boot capture were AI traffic. Without a")
+        self.w("     marked quiet baseline in this session, that cannot be separated.")
+        self.w("   - anything about the other robots.")
+        self.w("   - what was inside any encrypted session.")
+        print()
+        print("  " + "-" * 56)
+        if state == "FAILED":
+            print(f"  {BOLD}CAPTURE FAILED - nothing here is evidence about the robot.{OFF}"
+                  if colour_ok() else
+                  "  CAPTURE FAILED - nothing here is evidence about the robot.")
+            for b in broken[:4]:
+                print(f"    {b}")
+            print()
+            print("  Do NOT record this as a quiet robot. The capture did not run.")
+        elif state == "NOT LISTED":
+            print(f"  {BOLD}NO PACKETS; ADDRESS NOT LISTED BY AP AT ONE CHECK.{OFF}"
+                  if colour_ok() else
+                  "  NO PACKETS; ADDRESS NOT LISTED BY AP AT ONE CHECK.")
+            print()
+            print("  The capture ran. The AP did not list this address at the start")
+            print("  or end check. This does not prove whether the robot is off.")
+        elif state == "UNKNOWN":
+            print(f"  {BOLD}NO PACKETS; AP TABLE UNAVAILABLE.{OFF}" if colour_ok()
+                  else "  NO PACKETS; AP TABLE UNAVAILABLE.")
+            print()
+            print("  The capture ran, but the AP station table could not be read.")
+            print("  Check AP access before interpreting the missing traffic.")
+        elif state == "NO PACKETS":
+            print("  The capture ran and recorded no packets matching the filter.")
+            if self.mac:
+                print("  The AP listed this address at least once, but entries")
+                print("  can linger after shutdown. Confirm power state separately.")
+            else:
+                print("  This does not establish which robots were powered or active.")
+        else:
+            for k, v in sorted(self.counts.items(), key=lambda x: -x[1]):
+                if k == "_n":
+                    continue
+                print(f"  {c(f'{k:<8}', k)} {v} packets")
+        print()
+        print(f"  timeline: {self.log}")
+        print(f"  capture:  {self.pcap}")
+
+
+def pick_robot(ap, preset=None):
+    live = associated(ap)
+
+    def ap_listing(mac):
+        if live is None:
+            return "?", "could not read the AP station table"
+        return ("LISTED", "") if mac.lower() in live else ("not listed", "")
+
+    if preset:
+        for label, mac, _ in ROBOTS:
+            if label.lower() == preset.lower():
+                state, _ = ap_listing(mac)
+                if state == "not listed":
+                    print(f"\n  WARNING: the AP station table does not list "
+                          f"{label}'s address.\n")
+                elif state == "LISTED":
+                    print(f"\n  The AP lists {label}'s address. This does not "
+                          "prove the robot is powered.\n")
+                else:
+                    print("\n  The AP station table could not be read.\n")
+                return label, mac
+        sys.exit(f"unknown robot: {preset}. Known: " +
+                 ", ".join(r[0] for r in ROBOTS))
+
+    print("\n  WHICH ROBOT\n")
+    print("  AP station table snapshot. Listed does not prove the robot is on;")
+    print("  entries may remain after shutdown.\n")
+    for i, (label, mac, note) in enumerate(ROBOTS, 1):
+        state, _ = ap_listing(mac)
+        badge = (c("● AP lists address", "MARK") if state == "LISTED"
+                 else (c("○ not listed by AP", "?") if state == "not listed"
+                       else "? unknown"))
+        print(f"    {i}. {label:<10} {badge:<28} "
+              + (f"{DIM}{note}{OFF}" if colour_ok() else note))
+    if live is not None and not any(m.lower() in live for _, m, _ in ROBOTS):
+        print()
+        print("  The AP lists none of the configured robot addresses right now.")
+        print("  This alone does not establish their power state or traffic.")
+    print()
+    while True:
+        try:
+            s = input("  number: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.exit("\n  no robot chosen - nothing was started.")
+        if s.isdigit() and 1 <= int(s) <= len(ROBOTS):
+            label, mac, _ = ROBOTS[int(s) - 1]
+            state, _ = ap_listing(mac)
+            if state == "not listed":
+                print(f"\n  The AP does not list {label}'s address right now.")
+                print("  A capture may record nothing. Check the robot's physical")
+                print("  state and address attribution before interpreting it.")
+                try:
+                    if input("  listen anyway? [y/N] ").strip().lower() != "y":
+                        continue
+                except (EOFError, KeyboardInterrupt):
+                    sys.exit("\n  nothing was started.")
+            return label, mac
+        print("  pick a number from the list.")
+
+
+def main():
+    ap_arg = argparse.ArgumentParser(add_help=False)
+    ap_arg.add_argument("--check", action="store_true")
+    ap_arg.add_argument("--robot")
+    ap_arg.add_argument("--all-robots", action="store_true",
+                        help="Listen to EVERY robot in the table at once. Still "
+                             "filtered - records nothing belonging to anyone "
+                             "else. Use this when you need to know whether a "
+                             "single-robot filter is hiding traffic.")
+    ap_arg.add_argument("--everything", action="store_true",
+                        help="UNFILTERED. Records the whole bridge, including "
+                             "devices that are not ours. Requires "
+                             "RL_WIDE_OK=i-have-authorisation.")
+    ap_arg.add_argument("-h", "--help", action="store_true")
+    args = ap_arg.parse_args()
+
+    if args.help:
+        print(__doc__)
+        return 0
+
+    global ROBOTS
+    ROBOTS = load_robots()
+
+    print("=" * 60)
+    print("  ROBOT-LISTEN - watch one robot while you use it")
+    print("=" * 60)
+    print()
+    ok, ap = preflight()
+    print()
+    if args.check:
+        print("  READY." if ok else "  NOT READY. Nothing was started.")
+        return 0 if ok else 1
+    if not ok:
+        print("  Fix the FAIL lines above. Nothing was started.")
+        return 2
+
+    live = associated(ap)
+
+    if args.everything:
+        # Rule 2 exists because this segment carries devices belonging to people
+        # outside the project. An unfiltered capture records their traffic in
+        # full, so it is gated the same way rl-unattended-capture gates --wide.
+        if os.environ.get("RL_WIDE_OK") != "i-have-authorisation":
+            sys.exit(
+                "\n  --everything records the traffic of EVERY device on this\n"
+                "  segment, including devices that are not ours.\n\n"
+                "  That is a decision for a person, not a flag. If it is\n"
+                "  authorised and written down:\n\n"
+                "      RL_WIDE_OK=i-have-authorisation ./robot-listen --everything\n")
+        label, mac = "EVERYTHING", None
+        macs = []
+        # Exclude the SSH session that is CARRYING this capture. Without it the
+        # stream records itself: every captured packet is sent back over that
+        # session, which generates more packets to capture. Seen immediately on
+        # the first unfiltered run - the top talker was our own capture.
+        me = my_ip().split("/")[0]
+        flt = f"not (host {me} and host {ap} and port 22)" if me else ""
+        print("\n  *** UNFILTERED. Recording every device on this segment. ***")
+        if flt:
+            print("  (excluding this capture's own SSH stream, which would "
+                  "otherwise record itself)")
+        print()
+    elif args.all_robots:
+        macs = [m for _, m, _ in ROBOTS]
+        flt = " or ".join(f"ether host {m}" for m in macs)
+        label, mac = "all-robots", None
+        print(f"\n  Listening for all {len(macs)} configured robot addresses.")
+        if live is None:
+            print("  The AP station table could not be read.\n")
+        else:
+            on = [m for m in macs if m in live]
+            print(f"  The AP lists {len(on)} of them right now; this does not "
+                  "prove those robots are powered.\n")
+    else:
+        label, mac = pick_robot(ap, args.robot)
+        macs, flt = [mac], f"ether host {mac}"
+
+    lis = Listener(label, mac, ap, OUTDIR, filter_=flt, macs=macs)
+    lis.assoc_start = (mac.lower() in live) if (mac and live is not None) else None
+    lis.header()
+    _state = {True: "yes", False: "NO", None: "unknown"}[lis.assoc_start]
+    lis.w(f"# subject address listed by AP at start: {_state}")
+    lis.w("")
+
+    print()
+    print(f"  listening to {BOLD}{label}{OFF}" if colour_ok() else f"  listening to {label}")
+    print()
+    print("  TYPE WHAT YOU ARE DOING AND PRESS ENTER. It lands in the timeline")
+    print("  on the same clock as the packets. That is the whole point of this")
+    print("  tool - without it, nobody can tell later which traffic followed")
+    print("  which action.")
+    print()
+    print("    e.g.  asked it the weather")
+    print("          told it to stand")
+    print("          said nothing for 60s")
+    print()
+    print("  ---------------------------------------------------------")
+    print("  MARK A QUIET BASELINE FIRST, BEFORE YOU TOUCH THE ROBOT.")
+    print()
+    print("  These robots contact their cloud AI endpoints AT STARTUP,")
+    print("  not only when the AI is used - 400 of 1198 packets in a")
+    print("  plain boot capture were already AI traffic. Without a")
+    print("  quiet stretch to compare against, ordinary start-up chatter")
+    print("  reads as a response to you, and the session produces a")
+    print("  confident wrong answer.")
+    print("  ---------------------------------------------------------")
+    print()
+    print("  Ctrl-C to stop.")
+    print()
+
+    t = threading.Thread(target=lis.mark_reader, daemon=True)
+    t.start()
+
+    # No custom SIGINT handler. Installing one stops Python raising
+    # KeyboardInterrupt, which means the blocking read over the packet stream is
+    # never interrupted - on a quiet robot Ctrl-C looked like a hang. Letting the
+    # default behaviour stand is what makes it responsive.
+    try:
+        lis.listen()
+    except KeyboardInterrupt:
+        pass
+    lis.summary()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

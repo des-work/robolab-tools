@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# RoboLab — unattended robot capture
+#
+# Runs ON THE LAB PC. Captures AT THE ACCESS POINT. Writes pcaps to the
+# LAB PC's disk, streamed over SSH so nothing lands on the AP's 37 MB flash.
+#
+# Why not capture on the lab PC's own interface: its wifi is in managed
+# mode, so it sees only its own traffic plus broadcast. It cannot see robot
+# unicast. The AP is the only vantage point that can.
+#
+# SCOPE: passive observation only. Filtered to three known robot addresses
+# plus ARP/DHCP. Authorized management uses SSH; the capture does not scan robots.
+
+set -u
+TOOLDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+AP_MAC_PREFIX="${AP_MAC_PREFIX:-94:83:c4}"
+
+# The robot addresses are NOT written here. A hardcoded "address = this robot"
+# table is exactly the identifier mapping that is supposed to exist in one
+# gitignored file and nowhere else, and source control is the most durable and
+# most leakable place it could end up.
+#
+#   export ROBOLAB_ROBOT_IPS="a.b.c.d e.f.g.h"
+#
+# or leave it unset and the capture is filtered to the lab segment plus ARP and
+# DHCP, which is wider but leaks no mapping.
+ROBOTS="${ROBOLAB_ROBOT_IPS:-}"
+OUTROOT="${RL_OUTDIR:-$HOME/robolab-capture}"
+HOURS="${RL_HOURS:-4}"
+FILE_MB="${FILE_MB:-100}"
+MAX_FILES="${MAX_FILES:-40}"          # 40 x 100 MB = 4 GB ceiling
+MIN_FREE_MB="${MIN_FREE_MB:-5000}"    # refuse to start/continue below this
+CHECK_ONLY=0
+WIDE=0
+
+usage() {
+    cat <<USAGE
+rl-unattended-capture [--check] [--wide] [--hours N]
+
+  --check    verify every prerequisite and exit. RUN THIS BEFORE YOU LEAVE.
+  --wide     capture ALL segment traffic, not just the three robots.
+             Records other people's traffic. Requires RL_WIDE_OK=i-have-authorisation
+  --hours N  stop after N hours (default $HOURS)
+
+Environment:
+  RL_OUTDIR     where pcaps go        (default \$HOME/robolab-capture)
+  FILE_MB       size per file         (default $FILE_MB)
+  MAX_FILES     ring buffer size      (default $MAX_FILES)
+  MIN_FREE_MB   refuse below this     (default $MIN_FREE_MB)
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) CHECK_ONLY=1 ;;
+        --wide)  WIDE=1 ;;
+        --hours) shift; HOURS="${1:-4}" ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown option: $1"; usage; exit 2 ;;
+    esac
+    shift
+done
+
+say()  { printf '%s\n' "$*"; }
+fail() { printf 'FAIL  %s\n' "$*" >&2; FAILED=1; }
+ok()   { printf 'ok    %s\n' "$*"; }
+FAILED=0
+
+# ─────────────────────────────────────────────── locate the AP by MAC
+say "── prerequisites ──"
+
+MYIP=$(ip -4 -br address show scope global 2>/dev/null | awk '$1 !~ /docker|virbr/ {print $3}' | head -1)
+if ! python3 "$TOOLDIR/rl_network.py" "$MYIP"; then
+    fail "Not on the configured authorized lab network; no remote checks started."
+    exit 2
+fi
+AP=$(ip neighbor show 2>/dev/null | grep -i "$AP_MAC_PREFIX" | awk '{print $1}' | head -1)
+if [ -z "$AP" ]; then
+    fail "access point not in the neighbour cache."
+    say  "      It moves — it is a DHCP client. Do not type a remembered"
+    say  "      address. Open its page once, or ping it once, then re-run."
+else
+    ok "access point found by hardware address: $AP"
+
+    # ---- host key BEFORE the auth test ----------------------------------
+    # BatchMode does not ASK the host-key question, it FAILS it. So an access
+    # point that merely moved to a new address produces "Host key verification
+    # failed", which the auth test below then reports as a broken key. That
+    # misdiagnosis is worth a lab session. ap-hostkey separates the three.
+    HK="$(dirname "$0")/ap-hostkey"
+    if [ -x "$HK" ]; then
+        HKRC=0; "$HK" "$AP" || HKRC=$?
+        case "$HKRC" in
+            0|3) : ;;
+            4)   AP=""; fail "Refused unrecognized access-point host key." ;;
+            *)   : ;;           # unreachable: the auth test below will say so
+        esac
+    fi
+fi
+
+# ─────────────────────────────────────────────── ssh to the AP, unattended
+if [ -n "$AP" ]; then
+    if ssh -n -o BatchMode=yes -o ConnectTimeout=8 "root@$AP" 'echo __OK__' 2>/dev/null | grep -q __OK__; then
+        ok "key-based SSH to the AP works without a password"
+    else
+        fail "cannot SSH to the AP without a password."
+        say  "      An unattended capture CANNOT answer a password prompt."
+        say  "      Set up a key from THIS machine first:"
+        say  "          ssh-keygen -t ed25519            # if you have no key"
+        say  "          ssh-copy-id root@$AP            # asks for the AP password"
+        say  "      Do that yourself — this script never handles credentials."
+    fi
+
+    if ssh -n -o BatchMode=yes -o ConnectTimeout=8 "root@$AP" 'command -v tcpdump' 2>/dev/null | grep -q tcpdump; then
+        ok "tcpdump present on the AP"
+    else
+        fail "tcpdump not found on the AP"
+    fi
+
+    if ssh -n -o BatchMode=yes -o ConnectTimeout=8 "root@$AP" 'ip link show br-lan >/dev/null 2>&1 && echo __OK__' 2>/dev/null | grep -q __OK__; then
+        ok "br-lan exists on the AP (the client-facing bridge)"
+    else
+        fail "br-lan not found on the AP"
+    fi
+fi
+
+# ─────────────────────────────────────────────── local tools and disk
+command -v tcpdump >/dev/null 2>&1 && ok "tcpdump present locally (writes the files)" \
+                                   || fail "tcpdump not installed on this machine"
+
+mkdir -p "$OUTROOT" 2>/dev/null
+if [ -w "$OUTROOT" ]; then
+    ok "output directory writable: $OUTROOT"
+else
+    fail "cannot write to $OUTROOT"
+fi
+
+FREE_MB=$(df -Pm "$OUTROOT" 2>/dev/null | awk 'NR==2{print $4}')
+if [ -n "$FREE_MB" ] && [ "$FREE_MB" -ge "$MIN_FREE_MB" ]; then
+    ok "free space ${FREE_MB} MB (need ${MIN_FREE_MB} MB; ring buffer caps at $((FILE_MB*MAX_FILES)) MB)"
+else
+    fail "only ${FREE_MB:-?} MB free, need ${MIN_FREE_MB} MB"
+fi
+
+# ─────────────────────────────────────────────── the filter
+if [ "$WIDE" -eq 1 ]; then
+    if [ "${RL_WIDE_OK:-}" != "i-have-authorisation" ]; then
+        fail "--wide records the traffic of everyone on this segment."
+        say  "      11 of the 14 clients seen here are not ours. Capturing their"
+        say  "      payloads unattended is a decision for a person, not a script."
+        say  "      If it is authorised and written down, set:"
+        say  "          RL_WIDE_OK=i-have-authorisation"
+    fi
+    FILTER=""
+    SCOPE="WIDE — ALL SEGMENT TRAFFIC"
+else
+    F=""; N=0
+    for r in $ROBOTS; do F="${F:+$F or }host $r"; N=$((N+1)); done
+    if [ -z "$F" ]; then
+        # No addresses means no filter, and an empty "()" is not even valid BPF -
+        # tcpdump would refuse it at capture time, hours into an unattended run.
+        # Refusing here is the only correct answer: this project filters BEFORE
+        # it captures, and a tool that cannot build a filter must not start.
+        fail "no robot addresses given, so no filter can be built"
+        say  "      Set them for this shell and re-run:"
+        say  "          export ROBOLAB_ROBOT_IPS=\"a.b.c.d e.f.g.h\""
+        say  "      Ask the GA for the addresses. They are deliberately not in"
+        say  "      this script - a hardcoded robot-to-address table belongs in"
+        say  "      one gitignored file and nowhere else."
+        FILTER=""
+        SCOPE="NONE — refused"
+    else
+        FILTER="($F) or arp or (udp and (port 67 or port 68))"
+        SCOPE="$N robot address(es) + ARP/DHCP"
+        ok "filter scoped to: $SCOPE"
+    fi
+fi
+
+say ""
+if [ "$FAILED" -ne 0 ]; then
+    say "── NOT READY. Fix the FAIL lines above. Nothing was started. ──"
+    exit 1
+fi
+say "── all prerequisites met ──"
+[ "$CHECK_ONLY" -eq 1 ] && { say "(--check only; nothing started)"; exit 0; }
+
+# ─────────────────────────────────────────────── run
+STAMP=$(date -u +%Y-%m-%dT%H%M%SZ)
+DIR="$OUTROOT/$STAMP"
+mkdir -p "$DIR" || { echo "cannot create $DIR"; exit 1; }
+LOG="$DIR/run.log"
+DEADLINE=$(( $(date +%s) + HOURS*3600 ))
+
+{
+  echo "# RoboLab unattended capture"
+  echo "# started    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "# operator   ${RL_OPERATOR:-unset}"
+  echo "# lab pc     $(hostname) @ $MYIP"
+  echo "# ap         $AP (found by MAC prefix $AP_MAC_PREFIX)"
+  echo "# vantage    br-lan on the AP, streamed over SSH. Nothing written to the AP."
+  echo "# scope      $SCOPE"
+  echo "# filter     ${FILTER:-<none - wide>}"
+  echo "# stop at    $(date -u -d "@$DEADLINE" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "+${HOURS}h")"
+  echo "# ring       ${MAX_FILES} files x ${FILE_MB} MB = $((FILE_MB*MAX_FILES)) MB ceiling"
+  echo "#"
+  echo "# PASSIVE. Nothing was scanned, probed or transmitted by this host."
+  echo ""
+} > "$LOG"
+
+say "capturing -> $DIR"
+say "log        -> $LOG"
+say "stops at    $(date -u -d "@$DEADLINE" +%H:%M:%SZ 2>/dev/null || echo "+${HOURS}h")"
+say ""
+say "This process must OUTLIVE your SSH session. If you did not launch it"
+say "with setsid or nohup, stop now (Ctrl-C) and start it as:"
+say "    setsid nohup rl-unattended-capture --hours $HOURS > \$HOME/rl-cap.out 2>&1 &"
+say "Otherwise your logout kills it and you come back to nothing."
+
+ATTEMPT=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    ATTEMPT=$((ATTEMPT+1))
+
+    FREE_MB=$(df -Pm "$DIR" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt 1000 ]; then
+        echo "$(date -u +%H:%M:%SZ) STOPPING — only ${FREE_MB} MB free" >> "$LOG"
+        break
+    fi
+
+    REMAIN=$(( DEADLINE - $(date +%s) ))
+    [ "$REMAIN" -le 0 ] && break
+
+    echo "$(date -u +%H:%M:%SZ) segment $ATTEMPT starting (${REMAIN}s left, ${FREE_MB}MB free)" >> "$LOG"
+
+    ssh -n -o BatchMode=yes -o ConnectTimeout=10 \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+        "root@$AP" "timeout $REMAIN tcpdump -i br-lan -U -s 0 -w - ${FILTER:+\"$FILTER\"}" 2>>"$LOG" \
+      | tcpdump -r - -U -w "$DIR/robot" -C "$FILE_MB" -W "$MAX_FILES" 2>>"$LOG"
+
+    echo "$(date -u +%H:%M:%SZ) segment $ATTEMPT ended (rc=$?)" >> "$LOG"
+    [ "$(date +%s)" -ge "$DEADLINE" ] && break
+    sleep 5
+done
+
+echo "" >> "$LOG"
+echo "# finished $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG"
+echo "# files:" >> "$LOG"
+ls -lh "$DIR" >> "$LOG" 2>&1
+say "done — $DIR"

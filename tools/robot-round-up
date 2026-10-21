@@ -1,0 +1,698 @@
+#!/usr/bin/env bash
+# robot-round-up — chain phase 01: what a robot does on the network at startup.
+#
+#   robot-round-up              the walkthrough
+#   robot-round-up --dry-run    show what it would do, contact nothing
+#   robot-round-up --check      verify prerequisites and exit
+#
+# THIS SCRIPT DOES NOT POWER ROBOTS AND DOES NOT TELL ANYONE HOW TO.
+# Powering a G1 is a five-phase gantry procedure with a mandatory safety gate.
+# This script waits. It never sets the pace and it never counts down at anyone.
+#
+# WHAT IT IS FOR, AND WHY IT IS SHAPED THIS WAY
+#
+# It captures across a CONTROLLED BOOT, twice, on the SAME robot, and compares
+# the two. That is deliberate and it is not the obvious design.
+#
+# The obvious design boots all three robots once each. It produces more
+# coverage and it cannot answer the one question everything else rests on:
+# IS BOOT BEHAVIOUR REPRODUCIBLE? A single boot cannot tell a behaviour from an
+# event. If two boots of one robot do not resemble each other, then no phase
+# built on a startup baseline means anything, and we need to know that before
+# spending four sessions finding out the expensive way.
+#
+# So this run produces a VERDICT, not just pcaps.
+#
+# THREE THINGS IT DOES DIFFERENTLY FROM EVERY CAPTURE WE HAVE TAKEN
+#
+#   1. Filters on HARDWARE ADDRESS, not IP. At boot the robot has no IP yet.
+#      Every filter we have used to date would miss exactly the packets this
+#      exists to collect.
+#   2. Capture starts BEFORE the handler begins. The roll call proved a G1
+#      radio associates DURING the gantry procedure, minutes before anyone
+#      would call the robot up. A capture started at "up" has already missed it.
+#   3. It analyses in the room. A session that ends with pcaps ends with
+#      homework; a session that ends with an answer ends with a finding.
+#
+# IT NEVER SCANS. Authorized management uses SSH; no robot discovery probes are sent. Every packet comes from
+# traffic already flowing, observed at equipment we administer.
+
+set -uo pipefail
+TOOLDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+AP_MAC_PREFIX="${AP_MAC_PREFIX:-94:83:c4}"
+OUTDIR="${OUTDIR:-$HOME/Documents/robolab-evidence/scans}"
+SETTLE="${SETTLE:-180}"          # seconds to keep capturing after "up"
+BASELINE="${BASELINE:-120}"      # seconds of quiet-segment baseline
+DRY=0; CHECK=0
+case "${1:-}" in
+  --dry-run) DRY=1 ;;
+  --check)   CHECK=1 ;;
+  -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+  "") ;;
+  *) echo "unknown option: $1"; exit 2 ;;
+esac
+
+stamp() { date -u +%Y-%m-%dT%H%M%SZ; }
+iso()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now()   { date +%s; }
+say()   { printf '%s\n' "$*"; }
+hr()    { printf '%s\n' "════════════════════════════════════════════════════════════"; }
+sub()   { printf '%s\n' "────────────────────────────────────────────────────────────"; }
+# An unchecked `read` here is a safety problem, not a style one. On EOF read
+# returns immediately, so every pause in the procedure fires at once and the
+# script runs the whole G1 sequence with nobody at the gantry. A pause that
+# cannot wait must stop the run.
+pause() {
+    printf '\n    %s ' "${1:-Press enter to continue.}"
+    if ! read -r _; then
+        printf '\n\n    Input ended at a pause. This procedure requires a person\n'
+        printf '    at each step, so nothing further will run.\n\n'
+        exit 2
+    fi
+}
+
+RUN="$(stamp)"
+DIR="$OUTDIR/$RUN-robot-round-up"
+OUT="$DIR/00-RUN-LOG.txt"
+log() { printf '%s\n' "$*" >> "$OUT"; }
+
+# ═══════════════════════════════════════════════════════════ pre-flight
+
+preflight() {
+    if [ "$DRY" -eq 1 ]; then
+        AP="<ap>"
+        printf '  dry-run: remote checks disabled; all observations are rehearsal data.\n'
+        return 0
+    fi
+    local failed=0
+    ok()   { printf '  ok    %s\n' "$*"; }
+    bad()  { printf '  FAIL  %s\n' "$*"; failed=1; }
+
+    MYIP=$(ip -4 -br address show scope global 2>/dev/null \
+           | awk '$1 !~ /docker|virbr|lo/ {print $3}' | head -1)
+    ON_SEGMENT=0
+    if python3 "$TOOLDIR/rl_network.py" "$MYIP"; then
+        ok "on the configured lab network: $MYIP"; ON_SEGMENT=1
+    else
+        bad "NOT on the configured lab network (have ${MYIP:-none}); set RL_LAB_NETWORK"
+    fi
+
+    # Only look for the AP once the segment check has passed. The lab AP is a
+    # GL-MT3000 and at least one of us owns the same model at home, which shares
+    # the vendor prefix — so this lookup WILL match a home router. Finding "an"
+    # access point off-segment is worse than finding none: it reads as success.
+    if [ "$ON_SEGMENT" -ne 1 ]; then
+        bad "not looking for the access point — we are not on the lab segment"
+        say  "        The vendor prefix $AP_MAC_PREFIX is not unique. Off-segment it"
+        say  "        can match an identical device on whatever network you are"
+        say  "        actually on. Join the configured lab network first."
+        AP="<ap>"
+    else
+    AP=$(ip neighbor show 2>/dev/null | grep -i "$AP_MAC_PREFIX" | awk '{print $1}' | head -1)
+    if [ -z "$AP" ]; then
+        bad "access point not in the neighbour cache"
+        say  "        It moves — it is a DHCP client with a 3-day lease. Open its"
+        say  "        page once, or ping it once, then re-run. Never type a"
+        say  "        remembered address."
+        AP="<ap>"
+    else
+        ok "access point found by hardware address: $AP"
+    fi
+
+    if [ "$AP" != "<ap>" ]; then
+
+    # ---- host key BEFORE the auth test ----------------------------------
+    # BatchMode does not ASK the host-key question, it FAILS it. So an access
+    # point that merely moved to a new address produces "Host key verification
+    # failed", which the auth test below then reports as a broken key. That
+    # misdiagnosis is worth a lab session. ap-hostkey separates the three.
+    HK="$(dirname "$0")/ap-hostkey"
+    if [ -x "$HK" ]; then
+        HKRC=0; "$HK" "$AP" || HKRC=$?
+        case "$HKRC" in
+            0|3) : ;;
+            4)   AP="<ap>" ;;   # refused: an unknown device. Do not continue.
+            *)   : ;;           # unreachable: the auth test below will say so
+        esac
+    fi
+    fi
+
+    if [ "$AP" != "<ap>" ]; then
+        if ssh -n -o BatchMode=yes -o ConnectTimeout=8 "root@$AP" 'echo __OK__' 2>/dev/null | grep -q __OK__; then
+            ok "key-based SSH to the access point"
+        else
+            bad "cannot SSH to the access point without a password"
+            say  "        A capture that spans a boot cannot stop to answer a prompt."
+            say  "        Set up a key yourself:  ssh-copy-id root@$AP"
+            say  "        This script never handles credentials."
+        fi
+        ssh -n -o BatchMode=yes -o ConnectTimeout=8 "root@$AP" 'command -v tcpdump' 2>/dev/null \
+            | grep -q tcpdump && ok "tcpdump on the access point" || bad "tcpdump missing on the access point"
+    fi
+    fi
+
+    command -v tcpdump >/dev/null 2>&1 \
+        && ok "tcpdump locally (receives the stream)" || bad "tcpdump not installed here"
+
+    ZEEK=""
+    for z in zeek /opt/zeek/bin/zeek; do command -v "$z" >/dev/null 2>&1 && { ZEEK="$z"; break; }; done
+    if [ -n "$ZEEK" ]; then
+        ok "zeek at $ZEEK — the run will end with an answer"
+    else
+        bad "zeek not found — install it, or this run ends with pcaps and homework"
+        say  "        Reading a capture as text is what produced the lease-time"
+        say  "        error. zeek reads the value out of the packet."
+    fi
+
+    mkdir -p "$OUTDIR" 2>/dev/null
+    [ -w "$OUTDIR" ] && ok "output directory writable: $OUTDIR" || bad "cannot write to $OUTDIR"
+
+    FREE=$(df -Pm "$OUTDIR" 2>/dev/null | awk 'NR==2{print $4}')
+    [ "${FREE:-0}" -ge 2000 ] && ok "free space ${FREE} MB" || bad "only ${FREE:-?} MB free, want 2000+"
+
+    [ -n "${RL_OPERATOR:-}" ] && ok "operator: $RL_OPERATOR" \
+        || printf '  warn  RL_OPERATOR unset — this record cannot say who ran it\n'
+
+    return $failed
+}
+
+# ═══════════════════════════════════════════════════════ capture control
+
+# Start a filtered capture at the AP, streamed here. Writes a pcap, returns a pid.
+# Called as PID=$(start_capture ...), so EVERY backgrounded process here must
+# have stdout closed or redirected. A command substitution waits for its stdout
+# pipe to close, not for the foreground command to finish — a background child
+# that inherits it hangs the caller forever. The project has now hit this shape
+# of bug twice: once with `exit` inside $( ), and once here.
+start_capture() {
+    local file="$1" filter="$2"
+    if [ "$DRY" -eq 1 ]; then
+        ( sleep 3600 ) >/dev/null 2>&1 </dev/null &
+        echo $!
+        return 0
+    fi
+    ssh -n -o BatchMode=yes -o ConnectTimeout=10 \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+        "root@$AP" "tcpdump -i br-lan -U -s 0 -w - \"$filter\"" \
+        > "$file" 2>>"$DIR/capture-errors.txt" </dev/null &
+    echo $!
+}
+
+stop_capture() {
+    local pid="$1"
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    sleep 1
+}
+
+# ═══════════════════════════════════════════════════════════ analysis
+
+# Everything below reads a pcap. None of it touches the network.
+# Packets in a pcap, as an integer. Size is not a proxy: a capture that ran
+# correctly and saw nothing is exactly 24 bytes, which every size test passes.
+pkt_count() {
+    local f="$1"
+    [ -f "$f" ] || { echo 0; return; }
+    if command -v capinfos >/dev/null 2>&1; then
+        capinfos -c -M "$f" 2>/dev/null | awk -F: '/Number of packets/{gsub(/ /,"",$2);print $2;found=1}
+                                                   END{if(!found)print 0}'
+    else
+        tcpdump -r "$f" 2>/dev/null | grep -c . || echo 0
+    fi
+}
+
+analyse() {
+    # Split deliberately: `local a="$1" b="$a"` is unbound under `set -u`,
+    # because bash declares every name in the statement before assigning any of
+    # them. It fails at runtime, not at parse time — this one got as far as a
+    # test run before it showed itself.
+    local pcap="$1" tag="$2"
+    local zdir="$DIR/zeek-$tag"
+    [ -n "$ZEEK" ] || { echo "(no zeek — skipped)"; return 1; }
+    # NOT `[ -s "$pcap" ]`. A pcap that captured nothing is 24 bytes — the file
+    # header alone — so `-s` (size > 0) passes and the guard never fires. On
+    # 2026-09-30 run 181819Z all four captures were header-only, every guard
+    # passed, and the run was reported as REPRODUCIBLE. Count packets.
+    local n; n=$(pkt_count "$pcap")
+    [ "$n" -gt 0 ] || { echo "(capture recorded 0 packets — not analysed)"; return 1; }
+    mkdir -p "$zdir"
+    ( cd "$zdir" && "$ZEEK" -r "$pcap" LogAscii::use_json=F 2>/dev/null )
+    return 0
+}
+
+# Read a Zeek TSV by FIELD NAME. Never by column number — a Zeek upgrade
+# reorders columns and position-based code fails silently when it does.
+zfield() {
+    local file="$1"; shift
+    [ -f "$file" ] || return 1
+    python3 - "$file" "$@" <<'PY'
+import sys
+path, *want = sys.argv[1:]
+fields = None
+for line in open(path):
+    if line.startswith('#fields'):
+        fields = line.rstrip('\n').split('\t')[1:]
+    elif not line.startswith('#') and fields:
+        row = dict(zip(fields, line.rstrip('\n').split('\t')))
+        print('\t'.join(row.get(w, '-') for w in want))
+PY
+}
+
+# Turn one boot's Zeek output into the facts we came for.
+summarise_boot() {
+    local tag="$1" t0="$2"
+    local z="$DIR/zeek-$tag"
+    {
+    echo "### boot $tag"
+    echo
+    if [ ! -d "$z" ]; then echo "no analysis (zeek did not run)"; echo; return; fi
+
+    # Lead with the answers. A timeline is evidence; these are the findings,
+    # and an operator reading this in the room should not have to derive them.
+    echo "-- HEADLINE --"
+    local did_dhcp="no" first_pkt="-" n_dest=0 n_names=0 n_tls=0 lease="-"
+    if [ -f "$z/dhcp.log" ]; then
+        grep -q . "$z/dhcp.log" 2>/dev/null && did_dhcp="yes"
+        lease=$(zfield "$z/dhcp.log" lease_time 2>/dev/null | grep -v '^-$' | head -1)
+    fi
+    if [ -f "$z/conn.log" ]; then
+        first_pkt=$(zfield "$z/conn.log" ts 2>/dev/null | sort -n | head -1)
+        n_dest=$(zfield "$z/conn.log" id.resp_h 2>/dev/null | sort -u | grep -c . || true)
+    fi
+    [ -f "$z/dns.log" ] && n_names=$(zfield "$z/dns.log" query 2>/dev/null | sort -u | grep -c . || true)
+    [ -f "$z/ssl.log" ] && n_tls=$(zfield "$z/ssl.log" server_name 2>/dev/null | grep -c . || true)
+
+    if [ -n "$first_pkt" ] && [ "$first_pkt" != "-" ]; then
+        printf "   first packet          %+.1fs after capture start\n" \
+               "$(echo "$first_pkt $t0" | awk '{print $1-$2}')"
+    else
+        printf "   first packet          NONE — this robot said nothing at all\n"
+    fi
+    printf "   did it use DHCP?      %s\n" "$did_dhcp"
+    [ -n "${lease:-}" ] && [ "$lease" != "-" ] && \
+        printf "   lease offered         %s s (%.1f days)\n" "$lease" "$(echo "$lease" | awk '{print $1/86400}')"
+    printf "   distinct destinations %s\n" "$n_dest"
+    printf "   names resolved        %s\n" "$n_names"
+    printf "   encrypted sessions    %s\n" "$n_tls"
+    echo
+
+    echo "-- address acquisition --"
+    if [ -f "$z/dhcp.log" ]; then
+        zfield "$z/dhcp.log" msg_types client_addr server_addr host_name lease_time \
+          | awk -F'\t' '{printf "   %-10s client=%-15s server=%-14s name=%-10s lease=%s\n",$1,$2,$3,$4,$5}'
+    else
+        echo "   NO DHCP AT ALL. Either statically addressed, or it kept a lease"
+        echo "   across the power cycle. Both are findings; they are different findings."
+    fi
+    echo
+
+    echo "-- names resolved, in order --"
+    if [ -f "$z/dns.log" ]; then
+        zfield "$z/dns.log" ts query | sort -n | awk -F'\t' -v t0="$t0" \
+          '!seen[$2]++{printf "   %+7.1fs  %s\n", $1-t0, $2}'
+    else echo "   none"; fi
+    echo
+
+    echo "-- connections, in order --"
+    if [ -f "$z/conn.log" ]; then
+        zfield "$z/conn.log" ts id.resp_h id.resp_p proto service conn_state orig_bytes resp_bytes \
+          | sort -n | awk -F'\t' -v t0="$t0" \
+          '{printf "   %+7.1fs  %-15s :%-5s %-4s %-6s %-4s  %s/%s\n",$1-t0,$2,$3,$4,$5,$6,$7,$8}'
+    else echo "   none"; fi
+    echo
+
+    if [ -f "$z/ssl.log" ]; then
+        echo "-- encrypted sessions (name only, never contents) --"
+        zfield "$z/ssl.log" id.resp_h server_name version | awk -F'\t' '{printf "   %-15s  %-45s %s\n",$1,$2,$3}'
+        echo
+    fi
+    } >> "$OUT"
+}
+
+# The point of the whole run: do two boots of one robot look the same?
+compare_boots() {
+    local a="$DIR/zeek-boot1" b="$DIR/zeek-boot2"
+    {
+    echo
+    sub
+    echo "## THE VERDICT — is startup reproducible?"
+    sub
+    echo
+    if [ ! -d "$a" ] && [ ! -d "$b" ]; then
+        echo "NEITHER boot produced analysis. NO VERDICT IS POSSIBLE."
+        echo "Check capture-errors.txt and whether zeek ran at all. The pcaps"
+        echo "may still be good — re-analyse them off-line before concluding"
+        echo "anything about the robot."
+        return
+    fi
+    # Before anything is compared: did the captures record anything at all?
+    # comm(1) finds no difference between two empty sets, so an utterly failed
+    # run satisfies the REPRODUCIBLE test below. That is the worst failure a
+    # tool can have — it reports a total capture failure as the good outcome.
+    # It happened on 2026-09-30 run 181819Z. This gate exists because of it.
+    local na nb
+    na=$(pkt_count "$DIR/02-boot1.pcap")
+    nb=$(pkt_count "$DIR/03-boot2.pcap")
+    if [ "$na" -eq 0 ] || [ "$nb" -eq 0 ]; then
+        echo "CAPTURE FAILED — NO VERDICT IS POSSIBLE."
+        echo
+        echo "  boot 1 recorded $na packets"
+        echo "  boot 2 recorded $nb packets"
+        echo
+        echo "A capture that recorded nothing is not evidence that the robot did"
+        echo "nothing. Do NOT read this as a quiet robot, and do NOT read two"
+        echo "empty boots as agreeing with each other — they do not agree, they"
+        echo "are both absent."
+        echo
+        echo "Work down this list before concluding anything:"
+        echo "  1. Was the robot powered AND fully through its start-up procedure?"
+        echo "  2. Was it associated to the access point? Check the AP client list."
+        echo "  3. Did tcpdump start? See capture-errors.txt for 'listening on'."
+        echo "  4. Was the filter right for THIS robot?"
+        echo
+        echo "If tcpdump said 'listening on' and still got nothing, the capture"
+        echo "worked and the robot was not there. That is a different finding and"
+        echo "it belongs in the log as such."
+        return
+    fi
+    if [ ! -d "$a" ] || [ ! -d "$b" ]; then
+        echo "Only ONE boot produced analysis. NO VERDICT IS POSSIBLE."
+        echo "A single boot cannot distinguish a behaviour from an event."
+        echo "This run has produced a description, not a baseline. Say so, and"
+        echo "do not let the description be quoted later as a baseline."
+        return
+    fi
+
+    # LC_ALL=C throughout. `sort` and `comm` must agree on collation or the set
+    # difference is silently wrong, and under a UTF-8 locale the ordering is also
+    # unreadable to a person checking it by eye. Determinism matters more here
+    # than anywhere else in the script: this block produces the verdict.
+    local da db ca cb
+    da=$(zfield "$a/dns.log"  query      2>/dev/null | LC_ALL=C sort -u)
+    db=$(zfield "$b/dns.log"  query      2>/dev/null | LC_ALL=C sort -u)
+    ca=$(zfield "$a/conn.log" id.resp_h  2>/dev/null | LC_ALL=C sort -u)
+    cb=$(zfield "$b/conn.log" id.resp_h  2>/dev/null | LC_ALL=C sort -u)
+
+    echo "names resolved, boot 1 only:"; LC_ALL=C comm -23 <(printf '%s\n' "$da") <(printf '%s\n' "$db") | sed 's/^/   /'
+    echo "names resolved, boot 2 only:"; LC_ALL=C comm -13 <(printf '%s\n' "$da") <(printf '%s\n' "$db") | sed 's/^/   /'
+    echo "names in BOTH:";              LC_ALL=C comm -12 <(printf '%s\n' "$da") <(printf '%s\n' "$db") | sed 's/^/   /'
+    echo
+    echo "destinations, boot 1 only:";  LC_ALL=C comm -23 <(printf '%s\n' "$ca") <(printf '%s\n' "$cb") | sed 's/^/   /'
+    echo "destinations, boot 2 only:";  LC_ALL=C comm -13 <(printf '%s\n' "$ca") <(printf '%s\n' "$cb") | sed 's/^/   /'
+    echo "destinations in BOTH:";       LC_ALL=C comm -12 <(printf '%s\n' "$ca") <(printf '%s\n' "$cb") | sed 's/^/   /'
+    echo
+
+    local only1 only2
+    only1=$(LC_ALL=C comm -23 <(printf '%s\n' "$ca") <(printf '%s\n' "$cb") | grep -c . || true)
+    only2=$(LC_ALL=C comm -13 <(printf '%s\n' "$ca") <(printf '%s\n' "$cb") | grep -c . || true)
+
+    echo "HOW TO READ THIS:"
+    echo
+    if [ "$only1" -eq 0 ] && [ "$only2" -eq 0 ]; then
+        echo "  Both boots reached the same set of destinations."
+        echo "  Startup looks REPRODUCIBLE. A startup baseline is meaningful, and"
+        echo "  the chain is worth building on it. This is the good outcome and it"
+        echo "  is also the less interesting one."
+    else
+        echo "  The two boots DIFFER: $only1 destination(s) unique to boot 1,"
+        echo "  $only2 unique to boot 2."
+        echo
+        echo "  Do not treat this as a failed run. It is the most important result"
+        echo "  available from this session, and it means one of three things:"
+        echo "    1. Startup is genuinely variable -> a startup baseline cannot"
+        echo "       carry the weight the chain design puts on it. Say so, and"
+        echo "       abandon the chain rather than patching it."
+        echo "    2. The difference is upstream, not the robot -- a cloud service"
+        echo "       in a different state, DNS returning different addresses."
+        echo "       Check whether the NAMES match even where addresses do not."
+        echo "    3. The two boots were not actually comparable -- something else"
+        echo "       was powered, the window lengths differed, the settle time"
+        echo "       was cut short. Check the log before blaming the robot."
+        echo
+        echo "  Resolving which of those three is the next piece of work."
+    fi
+    } >> "$OUT"
+}
+
+# ═══════════════════════════════════════════════════════════════ start
+
+if [ "$CHECK" -eq 1 ]; then
+    hr; say "  ROBOT ROUND-UP — PREREQUISITES"; hr; say ""
+    preflight; rc=$?
+    say ""
+    [ $rc -eq 0 ] && say "  READY. Nothing was started." || say "  NOT READY. Fix the FAIL lines. Nothing was started."
+    exit $rc
+fi
+
+clear 2>/dev/null || true
+hr
+say "  ROBOT ROUND-UP"
+say "  Chain phase 01 — what a robot does on the network at startup"
+hr
+say ""
+say "  ⚠  THIS SCRIPT DOES NOT POWER ROBOTS."
+say ""
+say "     Powering a G1 is a five-phase gantry procedure with a mandatory"
+say "     safety gate, documented separately. Follow that, not this. This"
+say "     script waits for you and has no timer on the physical work."
+say ""
+say "  WHAT THIS RUN IS FOR"
+say ""
+say "     ONE robot. Booted TWICE. Captured across both, and compared."
+say ""
+say "     Not three robots once each. A single boot cannot tell a behaviour"
+say "     from an event, and every later phase of the chain assumes startup"
+say "     is stable enough to be a baseline. This run tests that assumption"
+say "     before we spend four sessions relying on it."
+say ""
+say "     If the two boots match, we have our first reproducible result."
+say "     If they do not, we have learned something more important."
+say ""
+say "  PEOPLE — three roles, and the scribe must not also be driving:"
+say ""
+say "     OPERATOR   at this keyboard. Runs this. Touches no robot."
+say "     HANDLER    at the gantry. Runs the G1 procedure. Says 'up' aloud."
+say "     SCRIBE     writes down what is done and WHEN, to the second."
+say ""
+say "     The scribe matters more than it sounds. From here on, the network"
+say "     record is not interpretable without knowing what a person did and"
+say "     when. That is a clipboard, not a tool."
+say ""
+pause "Read the above. Press enter when all three roles are filled."
+
+clear 2>/dev/null || true
+hr; say "  PHASE 0 — PRE-FLIGHT"; hr; say ""
+if ! preflight; then
+    say ""
+    if [ "$DRY" -eq 1 ]; then
+        say "  (--dry-run: continuing anyway so the walkthrough can be rehearsed"
+        say "   away from the lab. A real run stops here.)"
+    else
+        say "  Fix the FAIL lines above and re-run. Nothing was started."
+        exit 2
+    fi
+fi
+
+mkdir -p "$DIR"
+{
+  echo "# RoboLab — robot round-up (chain phase 01: startup)"
+  echo "# run at:    $(iso)"
+  echo "# operator:  ${RL_OPERATOR:-unset}"
+  echo "# host:      $(hostname) @ ${MYIP:-unknown}"
+  echo "# ap:        $AP  (found by hardware address prefix $AP_MAC_PREFIX)"
+  echo "# method:    capture at the AP's client bridge, streamed here, filtered"
+  echo "#            on HARDWARE ADDRESS so the robot is caught before it has an IP."
+  echo "# scope:     passive. Nothing scanned, probed or transmitted by us."
+  echo ""
+} > "$OUT"
+
+# ── which robot, and its hardware address ────────────────────────────────
+clear 2>/dev/null || true
+hr; say "  PHASE 1 — WHICH ROBOT"; hr; say ""
+say "    Pick the robot with the STRONGEST existing attribution. A weak"
+say "    attribution makes every result here ambiguous as well."
+say ""
+printf '    Robot label (e.g. Robot-A): '
+read -r ROBOT || { say "    No input. Nothing was started."; exit 2; }
+MAC=""
+# `read` must be checked. On EOF it returns non-zero WITHOUT setting MAC, so an
+# unchecked loop spins at full speed forever printing the rejection — found by
+# running --dry-run with stdin piped. A retry limit bounds the typo case too:
+# an operator who cannot produce a valid address needs the robot table, not
+# another prompt.
+MAC_TRIES=0
+while ! printf '%s' "$MAC" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'; do
+    MAC_TRIES=$((MAC_TRIES+1))
+    if [ "$MAC_TRIES" -gt 5 ]; then
+        say ""
+        say "    Five attempts, no valid address. Nothing was started."
+        say "    The addresses are in ~/.config/robolab/robots.json - or ask the GA."
+        exit 2
+    fi
+    printf '    Its hardware address (aa:bb:cc:dd:ee:ff): '
+    if ! read -r MAC; then
+        say ""
+        say "    Input ended before an address was given. Nothing was started."
+        exit 2
+    fi
+    printf '%s' "$MAC" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' \
+      || say "    That is not a hardware address. Six pairs, colon separated."
+done
+MAC=$(printf '%s' "$MAC" | tr 'A-F' 'a-f')
+FILTER="ether host $MAC"
+
+log "## subject"
+log "   label:  ${ROBOT:-unnamed}"
+log "   filter: $FILTER"
+log "   NOTE: filtering on hardware address, not IP. At boot there is no IP."
+log ""
+
+say ""
+say "    Filter: $FILTER"
+say "    Only this robot's frames are recorded. Nothing else on the segment"
+say "    is captured — not the other robots, and not anyone else's device."
+say ""
+pause "Press enter to begin."
+
+# ── baseline ─────────────────────────────────────────────────────────────
+clear 2>/dev/null || true
+hr; say "  PHASE 2 — BASELINE, ROBOT OFF"; hr; say ""
+say "    ${BASELINE}s of capture with the robot powered DOWN."
+say ""
+say "    This should be silent. If it is not, something is transmitting from"
+say "    that hardware address while the robot is supposedly off, and that is"
+say "    a finding in itself."
+say ""
+pause "Confirm with the handler that the robot is OFF, then press enter."
+
+log "## baseline (robot off) — started $(iso)"
+PID=$(start_capture "$DIR/01-baseline.pcap" "$FILTER")
+[ "$DRY" -eq 0 ] && sleep "$BASELINE"
+stop_capture "$PID"
+BN=$(tcpdump -r "$DIR/01-baseline.pcap" 2>/dev/null | wc -l)
+log "   packets while off: $BN"
+say ""
+if [ "${BN:-0}" -gt 0 ]; then
+    say "    ⚠  $BN packet(s) captured while the robot is supposedly OFF."
+    say "       Record this. Either the robot is not off, or that address"
+    say "       belongs to something else."
+    log "   WARNING: traffic from this address while the robot was reported off."
+else
+    say "    Silent, as expected. Baseline established."
+fi
+pause
+
+# ── the two boots ────────────────────────────────────────────────────────
+boot_round() {
+    local n="$1"
+    clear 2>/dev/null || true
+    hr; say "  PHASE 3.$n — BOOT $n OF 2"; hr; say ""
+    say "    CAPTURE STARTS FIRST, BEFORE ANYONE TOUCHES THE ROBOT."
+    say ""
+    say "    The roll call proved a G1's radio associates DURING the gantry"
+    say "    procedure, minutes before a handler would call the robot up. A"
+    say "    capture started at 'up' has already missed the beginning."
+    say ""
+    local OK=""
+    while [ "$OK" != "y" ]; do
+        printf '    Confirm: robot is OFF and nobody has begun the procedure? [y/N] '
+        if ! read -r OK; then say ""; say "    Input ended. Nothing further will run."; exit 2; fi
+        OK=${OK:-n}
+        [ "$OK" = "y" ] || say "    Wait until that is true."
+    done
+
+    local T0 PID
+    T0=$(now)
+    PID=$(start_capture "$DIR/0$((n+1))-boot$n.pcap" "$FILTER")
+    log "## boot $n — capture started $(iso)"
+    say ""
+    say "    ● capturing."
+    say ""
+    say "    HANDLER: power up $ROBOT now, following the G1 procedure."
+    say "             There is no timer. Take as long as it takes."
+    say "             Say 'up' when it is powered and stable."
+    say ""
+    pause "OPERATOR: press enter only after the handler says 'up'."
+    local TUP; TUP=$(now)
+    log "   handler confirmed up at $(iso)  (+$((TUP-T0))s after capture start)"
+    say ""
+    say "    Up at +$((TUP-T0))s. Capturing a further ${SETTLE}s of settled state."
+    say "    Leave it alone — this window is what 'freshly up, doing nothing'"
+    say "    looks like, and it is the thing phase 02 will be compared against."
+    say ""
+    [ "$DRY" -eq 0 ] && sleep "$SETTLE"
+    stop_capture "$PID"
+    log "   capture stopped $(iso)  (total $(( $(now) - T0 ))s)"
+    log ""
+
+    say "    Analysing..."
+    analyse "$DIR/0$((n+1))-boot$n.pcap" "boot$n"
+    summarise_boot "boot$n" "$T0"
+    say "    Done. Written to the run log."
+    pause
+}
+
+boot_round 1
+
+# ── shutdown, which is also phase 06 for free ────────────────────────────
+clear 2>/dev/null || true
+hr; say "  PHASE 4 — SHUTDOWN"; hr; say ""
+say "    Capture stays running while the robot is powered DOWN."
+say ""
+say "    Two things come from this. It is chain phase 06 for free — whether"
+say "    anything is sent on the way down. And the departure is the strongest"
+say "    identity evidence there is: if exactly this address goes quiet when"
+say "    this robot alone is powered off, the attribution is confirmed by a"
+say "    controlled change rather than by elimination."
+say ""
+T0=$(now)
+PID=$(start_capture "$DIR/04-shutdown.pcap" "$FILTER")
+log "## shutdown — capture started $(iso)"
+say "    ● capturing."
+say ""
+say "    HANDLER: power $ROBOT down, following the procedure. No timer."
+say ""
+pause "OPERATOR: press enter once it is fully down."
+[ "$DRY" -eq 0 ] && sleep 60
+stop_capture "$PID"
+SN=$(tcpdump -r "$DIR/04-shutdown.pcap" 2>/dev/null | wc -l)
+log "   packets during shutdown + 60s after: $SN"
+say ""
+say "    $SN packet(s) during shutdown."
+analyse "$DIR/04-shutdown.pcap" "shutdown" && summarise_boot "shutdown" "$T0"
+pause
+
+boot_round 2
+
+# ── verdict ──────────────────────────────────────────────────────────────
+compare_boots
+
+clear 2>/dev/null || true
+hr; say "  DONE"; hr; say ""
+say "    Everything is in:"
+say "      $DIR"
+say ""
+say "    Read 00-RUN-LOG.txt. It ends with the verdict."
+say ""
+say "    WHAT THIS RUN CAN AND CANNOT SUPPORT"
+say ""
+say "      It can say what this ONE robot did at startup, twice, and whether"
+say "      those two boots matched."
+say ""
+say "      It cannot say anything about the other robots, about steady-state"
+say "      behaviour beyond ${SETTLE}s, or about whether any of it is normal"
+say "      for a G1 in general. Those need phase 02 and more sessions."
+say ""
+say "    Append what the scribe wrote to the run log before you leave the"
+say "    room. The network record is not interpretable without it."
+say ""
+log ""
+log "## what this run does NOT establish"
+log "   - anything about the other robots"
+log "   - steady-state behaviour beyond the ${SETTLE}s settle window"
+log "   - whether any observed behaviour is normal for a G1 in general"
+log "   - causation for any difference between the two boots"
+log ""
+log "## scribe notes (append before leaving the room)"
+log ""

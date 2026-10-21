@@ -1,0 +1,12 @@
+[
+  {
+    "name": "Robot-A",
+    "mac": "00:11:22:aa:bb:cc",
+    "note": "how this attribution is known - confirmed / probable / single source"
+  },
+  {
+    "name": "Robot-B",
+    "mac": "00:11:22:aa:bb:dd",
+    "note": "keep this honest; the picker shows it and people rely on it"
+  }
+]

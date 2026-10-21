@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""wire-listen - watch the CABLE between an operator's PC and a robot.
+
+    wire-listen --host <their-address> --check
+    wire-listen --host <their-address> --user <their-login>
+    wire-listen --host <their-address> --user <their-login> --iface enp2s0
+
+WHY THIS IS A SEPARATE TOOL
+---------------------------
+robot-listen captures at the access point and sees the robot's WIRELESS traffic.
+Commands sent over an ethernet cable never reach the access point - they are a
+direct link between one PC and the robot, on the robot's own internal subnet.
+No capture point on the wireless side can see them. That is topology, not a
+limitation of any tool.
+
+So this captures on the OPERATOR'S MACHINE instead, over SSH, and streams the
+packets back here the same way robot-listen does.
+
+Run both at once and you get the two halves of one event: a command on the wire,
+and whatever the robot says to the internet a second later. They share a UTC
+clock, so they line up.
+
+THIS CAPTURES ON SOMEBODY ELSE'S COMPUTER
+-----------------------------------------
+That is a consent question before it is a technical one. The tool therefore:
+
+  * filters to the ROBOT SUBNET ONLY (192.168.123.0/24 by default), so the
+    operator's browsing, mail, campus traffic and everything else is never
+    recorded - not recorded and discarded, never captured at all;
+  * refuses to run until you confirm the person at that machine knows;
+  * writes who authorised it into the record.
+
+A wider filter is not offered. If you need one, that is a conversation, not a
+flag.
+
+SCOPE
+-----
+Passive. Management queries and capture transport use authorized SSH. One SSH connection to a
+machine you were given the address of, running tcpdump on its own interface.
+"""
+
+import argparse
+from rl_network import on_lab_network
+import hashlib
+import os
+import re
+import select
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+OUTDIR = Path(os.environ.get("OUTDIR", Path.home() / "Documents/robolab-evidence/scans"))
+
+# The robot's own internal subnet. Vendor-fixed; see ga/TOOL-REFERENCE.md.
+ROBOT_NET = os.environ.get("ROBOT_NET", "192.168.123.0/24")
+
+_ABS_TS = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)")
+_ENDPOINTS = re.compile(r"\bIP6?\s+(\S+?)\s+>\s+(\S+?):")
+_ARP_REQ = re.compile(r"ARP, Request who-has (\S+?) tell (\S+?)[,\s]")
+_ARP_REP = re.compile(r"ARP, Reply (\S+?) is-at ([0-9a-f:]+)", re.I)
+
+GREEN, BOLD, DIM, OFF = "\033[38;5;120m", "\033[1m", "\033[2m", "\033[0m"
+
+
+def iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def stamp():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+
+
+def colour_ok():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+# When a master connection is open, every later ssh reuses it and nobody is
+# prompted again. CONTROL holds its socket path, or "" for plain key auth.
+CONTROL = ""
+
+
+def _ssh_opts():
+    o = ["-o", "ConnectTimeout=8"]
+    if CONTROL:
+        o += ["-o", f"ControlPath={CONTROL}"]
+    else:
+        o += ["-o", "BatchMode=yes"]
+    return o
+
+
+def ssh(target, cmd, timeout=15):
+    """One SSH call. stdin is closed - ssh will otherwise eat the operator's marks."""
+    try:
+        return subprocess.run(
+            ["ssh"] + _ssh_opts() + [target, cmd],
+            capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL)
+    except Exception:
+        return None
+
+
+def open_master(target):
+    """Authenticate ONCE, interactively, and hold the connection open.
+
+    THE PASSWORD IS NEVER HANDLED BY THIS PROGRAM. ssh prompts the terminal
+    directly; we neither read it, store it, pass it as an argument, nor let it
+    reach the shell history. After this, every other ssh in the session rides
+    the same socket and nothing prompts again.
+
+    The better fix is still a key - run `ssh-copy-id <target>` once and this
+    flag stops being needed.
+    """
+    global CONTROL
+    # hashlib, not hash(): Python randomises str hashing per process, so a
+    # hash()-derived path differs every run - the socket is never reused and you
+    # are asked for the password every single time, which defeats the point.
+    tag = hashlib.sha256(target.encode()).hexdigest()[:10]
+    sock = f"/tmp/robolab-wire-{os.getuid()}-{tag}"
+    if os.path.exists(sock):
+        CONTROL = sock
+        return True
+    print("  Opening one authenticated connection. ssh will ask for the")
+    print("  password - type it at ITS prompt. Nothing here reads or keeps it.")
+    print()
+    # DELIBERATE: this is the ONE subprocess in this file that inherits stdin,
+    # and it must. ssh prompts for the password on this terminal; stdin=DEVNULL
+    # here would make the prompt unanswerable and every run fail. Every other
+    # subprocess in this file is stdin=DEVNULL so none of them can steal the
+    # operator's keystrokes. Do not "fix" this one to match them.
+    r = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=10", "-o", "ControlMaster=yes",
+         "-o", f"ControlPath={sock}", "-o", "ControlPersist=4h",
+         "-fN", target])
+    if r.returncode != 0 or not os.path.exists(sock):
+        print("\n  Could not open the connection. Nothing was started.")
+        return False
+    CONTROL = sock
+    print("  Connected. That password will not be asked for again this session.")
+    print()
+    return True
+
+
+def preflight(target, iface, verbose=True):
+    ok, fail, warn = [], [], []
+
+    mine = ""
+    r = subprocess.run(["ip", "-4", "-br", "address", "show", "scope", "global"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    for line in r.stdout.splitlines():
+        p = line.split()
+        if p and not p[0].startswith(("docker", "virbr", "lo")):
+            mine = p[-1]
+            break
+    (ok if on_lab_network(mine) else fail).append(
+        f"we are on the lab segment: {mine or 'no address'}")
+
+    (ok if shutil.which("tcpdump") else fail).append("tcpdump locally (receives the stream)")
+
+    if not on_lab_network(mine):
+        if verbose:
+            print("FAIL: configure RL_LAB_NETWORK and join the authorized lab network")
+        return False, iface
+    probe = ssh(target, "echo __OK__")
+    if probe and probe.returncode == 0 and "__OK__" in probe.stdout:
+        ok.append(f"key-based SSH to {target}")
+    else:
+        fail.append(f"cannot SSH to {target} without a password")
+        if verbose:
+            print(f"      An unattended capture cannot answer a password prompt.")
+            print(f"      The person at that machine runs, on their machine:")
+            print(f"          sudo systemctl enable --now ssh      # if not already on")
+            print(f"      and then YOU send them your public key, or they run:")
+            print(f"          ssh-copy-id {target}   # from your machine, they type their password")
+            print(f"      Never type their password into anything here.")
+
+    detected = iface
+    if probe and probe.returncode == 0:
+        r2 = ssh(target, "command -v tcpdump || echo MISSING")
+        got = (r2.stdout.strip() if r2 else "")
+        (ok if got and "MISSING" not in got else fail).append(
+            f"tcpdump on {target}" + ("" if got and "MISSING" not in got
+                                      else " - they need: sudo apt install tcpdump"))
+
+        # Which interface carries the robot link? Ask the machine, do not guess.
+        r3 = ssh(target, "ip -4 -o addr show | awk '{print $2, $4}'")
+        if r3 and r3.returncode == 0:
+            lines = [l for l in r3.stdout.splitlines() if l.strip()]
+            robot_ifaces = [l.split()[0] for l in lines if on_lab_network(l.split()[1], ROBOT_NET)]
+            if robot_ifaces:
+                detected = detected or robot_ifaces[0]
+                ok.append(f"robot link found on {robot_ifaces[0]} "
+                          f"({[l for l in lines if l.startswith(robot_ifaces[0])][0].split()[1]})")
+            else:
+                fail.append(f"no interface on that machine belongs to {ROBOT_NET}; "
+                            "address - the cable is not connected, or the robot "
+                            "link is not up")
+                if verbose:
+                    for l in lines:
+                        print(f"      has: {l}")
+
+        r4 = ssh(target, "sudo -n true 2>/dev/null && echo YES || echo NO")
+        if r4 and "YES" in (r4.stdout or ""):
+            ok.append("passwordless sudo there (tcpdump needs root)")
+        else:
+            warn.append("no passwordless sudo on that machine - tcpdump may fail. "
+                        "Either grant it, or have them run: "
+                        "sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)")
+
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    (ok if os.access(OUTDIR, os.W_OK) else fail).append(f"writable: {OUTDIR}")
+    free_mb = shutil.disk_usage(OUTDIR).free // (1024 * 1024)
+    (ok if free_mb >= 1000 else fail).append(f"free space {free_mb} MB (want 1000+)")
+
+    if os.environ.get("RL_OPERATOR"):
+        ok.append(f"operator: {os.environ['RL_OPERATOR']}")
+    else:
+        warn.append("RL_OPERATOR unset - this record cannot say who ran it")
+
+    if verbose:
+        for s in ok:
+            print(f"  ok    {s}")
+        for s in fail:
+            print(f"  FAIL  {s}")
+        for s in warn:
+            print(f"  warn  {s}")
+    return (not fail), detected
+
+
+class WireListener:
+    def __init__(self, target, iface, net, outdir, consent):
+        self.target, self.iface, self.net = target, iface, net
+        self.consent = consent
+        self.dir = outdir / f"{stamp()}-wire-listen-{target.replace('@','_at_')}"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.log = self.dir / "00-TIMELINE.txt"
+        self.pcap = self.dir / "01-capture.pcap"
+        self.counts = {}
+        self.t0 = time.time()
+        self.stop = threading.Event()
+        self._wlock = threading.Lock()
+
+    def w(self, line):
+        with self._wlock:
+            with open(self.log, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+
+    def header(self):
+        self.w("# ############################################################")
+        self.w("# GA ONLY - NOT SHAREABLE")
+        self.w("#")
+        self.w("# Captured on a machine belonging to somebody else, with their")
+        self.w("# knowledge. Filtered to the robot link only - their own traffic")
+        self.w("# was never captured, not captured and discarded.")
+        self.w("# ############################################################")
+        self.w("#")
+        self.w("# RoboLab - wire-listen")
+        self.w(f"# run at:     {iso()}")
+        self.w(f"# operator:   {os.environ.get('RL_OPERATOR', 'unset')}")
+        self.w(f"# machine:    {self.target}")
+        self.w(f"# interface:  {self.iface}")
+        self.w(f"# filter:     net {self.net}")
+        self.w(f"# authorised: {self.consent}")
+        self.w("#")
+        self.w("# This sees commands travelling over the CABLE. It cannot see what")
+        self.w("# the robot sends to the internet - that goes over wifi and is")
+        self.w("# visible only at the access point. Run robot-listen alongside")
+        self.w("# this one for the other half; they share a UTC clock.")
+        self.w("")
+
+    def endpoints(self, line):
+        a = _ARP_REQ.search(line)
+        if a:
+            return f"{a.group(2)} (asking)", f"who-has {a.group(1)}"
+        a = _ARP_REP.search(line)
+        if a:
+            return f"{a.group(1)} (answering)", ""
+        m = _ENDPOINTS.search(line)
+        if m:
+            return m.group(1), m.group(2)
+        return "", ""
+
+    def mark_reader(self):
+        while not self.stop.is_set():
+            r, _, _ = select.select([sys.stdin], [], [], 0.4)
+            if not r:
+                continue
+            text = sys.stdin.readline()
+            if not text:
+                break
+            text = text.strip() or "(unlabelled mark)"
+            self.w(f"{iso()}  >>> MARK: {text}")
+            el = time.time() - self.t0
+            if colour_ok():
+                print(f"  {GREEN}MARK{OFF}  {el:7.1f}s  {BOLD}{text}{OFF}")
+            else:
+                print(f"  MARK  {el:7.1f}s  {text}")
+
+    def listen(self):
+        # `sudo -n` so it fails rather than prompting. The filter is the whole
+        # consent story: only the robot link, nothing else on that machine.
+        remote = (f"sudo -n tcpdump -i {shlex.quote(self.iface)} -U -s 0 -w - "
+                  f"net {self.net}")
+        ctl = f"-o ControlPath={CONTROL} " if CONTROL else "-o BatchMode=yes "
+        cmd = (f"ssh {ctl}-o ConnectTimeout=10 -o ServerAliveInterval=15 "
+               f"{self.target} {shlex.quote(remote)} | tee {shlex.quote(str(self.pcap))} | "
+               f"TZ=UTC tcpdump -r - -n -l -tttt")
+        attempt = 0
+        while not self.stop.is_set():
+            attempt += 1
+            if attempt > 1:
+                msg = f"capture stream ended - reconnecting (attempt {attempt})"
+                self.w(f"{iso()}  >>> {msg}")
+                print(f"  RECONN {msg}")
+                time.sleep(2)
+            if not self._segment(cmd):
+                break
+        self.stop.set()
+
+    def _segment(self, cmd):
+        """One connection's worth of stream. True if it is worth retrying.
+
+        A session will lose its ssh eventually. Ending silently would leave the
+        operator marking actions into a log that had stopped recording packets -
+        a record that looks complete and is not.
+        """
+        proc = subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.PIPE,
+                                stderr=open(self.dir / "capture-errors.txt", "a"),
+                                stdin=subprocess.DEVNULL, text=True, bufsize=1)
+        got_any = False
+        try:
+            for line in proc.stdout:
+                if self.stop.is_set():
+                    break
+                line = line.rstrip("\n")
+                if not line or line.startswith("reading from"):
+                    continue
+                src, dst = self.endpoints(line)
+                mt = _ABS_TS.match(line)
+                when = (mt.group(1).replace(" ", "T") + "Z") if mt else iso()
+                kind = "ARP" if "ARP" in line else ("WIRE" if src or dst else "?")
+                self.counts[kind] = self.counts.get(kind, 0) + 1
+                pair = f"{src} > {dst}" if src or dst else "-"
+                self.w(f"{when}  {kind:<5} {pair:<44} {line[:200]}")
+                el = time.time() - self.t0
+                print(f"  {kind:<5} {el:7.1f}s  {pair}")
+                got_any = True
+                # A capture that fills the disk takes the evidence tree with it.
+                if sum(self.counts.values()) % 500 == 0:
+                    if shutil.disk_usage(self.dir).free < 500 * 1024 * 1024:
+                        self.w(f"{iso()}  >>> STOPPING - less than 500 MB free")
+                        print("  STOPPING - less than 500 MB free")
+                        self.stop.set()
+                        break
+        except KeyboardInterrupt:
+            self.stop.set()
+        finally:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        return got_any and not self.stop.is_set()
+
+    def summary(self):
+        err = ""
+        try:
+            err = (self.dir / "capture-errors.txt").read_text(encoding="utf-8")
+        except OSError:
+            pass
+        size = self.pcap.stat().st_size if self.pcap.exists() else 0
+        benign = ("listening on", "reading from", "Interrupted system call")
+        broken = [l for l in err.splitlines()
+                  if l.strip() and not any(b in l for b in benign)]
+
+        self.w("")
+        self.w("## did the capture run?")
+        if size < 24 or "listening on" not in err:
+            state = "FAILED"
+            self.w("   FAILED - the capture never started. Nothing here is evidence.")
+            for b in broken:
+                self.w(f"   stderr: {b}")
+        elif not self.counts:
+            state = "SILENT"
+            self.w("   SILENT - the capture ran and nothing crossed the cable in")
+            self.w("   this window. That is a result, and it is only a result")
+            self.w("   because the capture is known to have been live.")
+        else:
+            state = "OK"
+            for k, v in sorted(self.counts.items(), key=lambda x: -x[1]):
+                self.w(f"   {k:<6} {v}")
+        self.w("")
+        self.w("## what this does NOT establish")
+        self.w("   - what the robot sent to the internet. That goes over wifi and")
+        self.w("     is not visible from this machine at all.")
+        self.w("   - that a marked action caused the traffic near it. Correlation.")
+        self.w(f"   - anything about traffic outside {ROBOT_NET}, which was")
+        self.w("     deliberately never captured.")
+
+        print()
+        print("  " + "-" * 56)
+        if state == "FAILED":
+            print("  CAPTURE FAILED - nothing here is evidence.")
+            for b in broken[:4]:
+                print(f"    {b}")
+        elif state == "SILENT":
+            print("  The capture RAN and nothing crossed the cable.")
+            print("  That is a result - the capture is known to have been live.")
+        else:
+            for k, v in sorted(self.counts.items(), key=lambda x: -x[1]):
+                print(f"  {k:<6} {v} packets")
+        print()
+        print(f"  timeline: {self.log}")
+        print(f"  capture:  {self.pcap}")
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--host")
+    ap.add_argument("--user")
+    ap.add_argument("--iface")
+    ap.add_argument("--net", default=ROBOT_NET)
+    ap.add_argument("--ask-password", action="store_true",
+                    help="No key yet? Open ONE authenticated connection that ssh "
+                         "prompts you for, and reuse it for the whole session. "
+                         "You type the password into ssh itself - it is never "
+                         "stored, never passed as an argument, and never enters "
+                         "your shell history.")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    args = ap.parse_args()
+
+    if args.help or not args.host:
+        print(__doc__)
+        return 0
+
+    target = f"{args.user}@{args.host}" if args.user else args.host
+
+    print("=" * 62)
+    print("  WIRE-LISTEN - watch the cable between a PC and a robot")
+    print("=" * 62)
+    print()
+    if args.ask_password and not open_master(target):
+        return 2
+    ok, iface = preflight(target, args.iface)
+    print()
+    if args.check:
+        print("  READY." if ok else "  NOT READY. Nothing was started.")
+        if CONTROL:
+            print(f"\n  A connection is being held open for 4h: {CONTROL}")
+            print(f"  Close it early with:  ssh -O exit -o ControlPath={CONTROL} {target}")
+        return 0 if ok else 1
+    if not ok:
+        print("  Fix the FAIL lines above. Nothing was started.")
+        return 2
+    if not iface:
+        print("  No interface given and none detected. Pass --iface.")
+        return 2
+
+    print("  THIS CAPTURES ON SOMEBODY ELSE'S COMPUTER.")
+    print()
+    print(f"  It will record traffic on {iface} matching net {args.net} only -")
+    print("  the robot link. Their browsing, mail and everything else on that")
+    print("  machine is never captured.")
+    print()
+    try:
+        who = input("  Who at that machine agreed to this? (name, or blank to abort) ").strip()
+    except (EOFError, KeyboardInterrupt):
+        who = ""
+    if not who:
+        print("\n  No authorisation recorded. Nothing was started.")
+        return 2
+
+    lis = WireListener(target, iface, args.net, OUTDIR, who)
+    lis.header()
+
+    print()
+    print(f"  listening on {target}:{iface}, net {args.net}")
+    print()
+    print("  Type what is happening and press enter - it lands in the timeline")
+    print("  on the same UTC clock as the packets, and as robot-listen's.")
+    print()
+    print("  Run robot-listen --all-robots in another terminal for the other")
+    print("  half: this sees the commands, that sees what the robot says to")
+    print("  the internet in response.")
+    print()
+    print("  Ctrl-C to stop.")
+    print()
+
+    threading.Thread(target=lis.mark_reader, daemon=True).start()
+    try:
+        lis.listen()
+    except KeyboardInterrupt:
+        pass
+    lis.summary()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

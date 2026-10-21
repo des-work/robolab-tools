@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""robot-show - open the evidence, fast, in front of people.
+
+    robot-show                 browse everything
+    robot-show runs            jump straight to the capture runs
+    robot-show logs            the GA session logs
+    robot-show find <text>     search every log and timeline
+    robot-show --raw           show hardware addresses (GA only, not on a screen)
+
+WHY THIS REDACTS BY DEFAULT
+
+    The timelines and run logs contain hardware addresses on purpose - they are
+    evidence. This tool is for showing things to a room, and a room is exactly
+    where those must not appear. So addresses are replaced with stable labels:
+    the same address is the same label every time, so you can still follow one
+    device through a file without the file naming it.
+
+    --raw turns that off and says so loudly. Use it alone, at a desk.
+
+NOTHING HERE TOUCHES THE NETWORK. It reads files that already exist.
+"""
+import os, re, sys, subprocess, shutil, hashlib, json
+from pathlib import Path
+
+ROOT    = Path(os.environ.get("ROBOLAB_EVIDENCE", Path.home()/"Documents/robolab-evidence"))
+SCANS   = ROOT/"scans"
+GA      = ROOT/"ga"
+SHARE   = Path.home()/"Documents/robolab-share"
+MANIFEST= ROOT/"captures/00-MANIFEST.tsv"
+
+RAW = "--raw" in sys.argv
+if RAW: sys.argv.remove("--raw")
+
+# ---------------------------------------------------------------- appearance
+def tty():   return sys.stdout.isatty()
+def colour():return tty() and os.environ.get("NO_COLOR") is None
+B  = "\033[1m"   if colour() else ""
+D  = "\033[2m"   if colour() else ""
+R_ = "\033[31m"  if colour() else ""
+G  = "\033[32m"  if colour() else ""
+Y  = "\033[33m"  if colour() else ""
+C  = "\033[36m"  if colour() else ""
+X  = "\033[0m"   if colour() else ""
+def W(): return shutil.get_terminal_size((100, 30)).columns
+
+def hr(ch="─"): print(D + ch*min(W(), 100) + X)
+def head(t):
+    print(); hr("━"); print(f"  {B}{t}{X}"); hr("━")
+
+# ---------------------------------------------------------------- redaction
+MAC_RE = re.compile(r"\b([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b")
+
+def _known_macs():
+    """Label robots by name where we know them, so a redacted file still reads."""
+    out = {}
+    f = Path(os.environ.get("ROBOLAB_ROBOTS", Path.home()/".config/robolab/robots.json"))
+    try:
+        d = json.loads(f.read_text())
+    except Exception:
+        return out
+    # The table has been written both ways across this project: a list of
+    # {name, mac} and a mapping of name -> {mac}. Accept either rather than
+    # silently labelling every robot "device-A" because the shape changed.
+    items = d.items() if isinstance(d, dict) else [
+        (r.get("name", ""), r) for r in d if isinstance(r, dict)]
+    for name, v in items:
+        mac = (v.get("mac") if isinstance(v, dict) else v) or ""
+        if mac and name: out[str(mac).lower()] = str(name)
+    return out
+
+KNOWN = _known_macs()
+_seen = {}
+def _label(mac):
+    m = mac.lower()
+    if m in KNOWN: return f"[{KNOWN[m]}]"
+    if m not in _seen:
+        _seen[m] = f"[device-{chr(ord('A') + len(_seen) % 26)}]"
+    return _seen[m]
+
+def redact(text):
+    if RAW: return text
+    return MAC_RE.sub(lambda m: _label(m.group(0)), text)
+
+def banner():
+    if RAW:
+        print(f"{R_}{B}  RAW - hardware addresses are visible. Not for a screen anyone else can see.{X}")
+    else:
+        print(f"{D}  addresses redacted to stable labels · --raw to show them{X}")
+
+# ---------------------------------------------------------------- manifest
+def manifest():
+    rows = {}
+    if MANIFEST.exists():
+        for line in MANIFEST.read_text().splitlines():
+            if line.startswith("#") or line.startswith("path\t"): continue
+            p = line.split("\t")
+            if len(p) >= 6: rows[p[0]] = {"packets": p[1], "first": p[2], "bytes": p[4], "sha": p[5]}
+    return rows
+MAN = manifest()
+
+def packets_for(run):
+    tot, n = 0, 0
+    for k, v in MAN.items():
+        if k.startswith(f"scans/{run.name}/"):
+            try: tot += int(v["packets"]); n += 1
+            except ValueError: pass
+    return tot, n
+
+# ---------------------------------------------------------------- run facts
+VERDICTS = {
+    "CAPTURE FAILED":          (R_, "capture never ran"),
+    "NO VERDICT IS POSSIBLE":  (R_, "no verdict"),
+    "NOT LISTED":              (Y,  "address absent from one AP read"),
+    "NO PACKETS":              (C,  "no packets matched the capture filter"),
+    "NOT PRESENT":             (Y,  "historical: AP did not list address"),
+    "UNKNOWN":                 (Y,  "could not tell"),
+    "SILENT":                  (C,  "historical: no matching packets"),
+    "REPRODUCIBLE":            (G,  "startup reproducible"),
+    "DIFFER":                  (G,  "boots differ"),
+}
+
+def primary_doc(run):
+    for n in ("00-TIMELINE.txt", "00-RUN-LOG.txt"):
+        if (run/n).exists(): return run/n
+    return None
+
+def run_facts(run):
+    doc = primary_doc(run)
+    text = doc.read_text(errors="replace") if doc else ""
+    subject = ""
+    m = re.search(r"^#?\s*subject:\s*(.+)$", text, re.M)
+    if m: subject = m.group(1).strip()
+    if not subject:                       # robot-round-up writes "   label:  <name>"
+        m = re.search(r"^\s*label:\s*(.+)$", text, re.M)
+        if m: subject = m.group(1).strip()
+    if not subject:
+        m = re.search(r"robot-(?:listen|round-up|roll-call)-(.+)$", run.name)
+        subject = m.group(1) if m else "—"
+    verdict, vcol, vwhy = "", "", ""
+    for key, (col, why) in VERDICTS.items():
+        if key in text: verdict, vcol, vwhy = key, col, why; break
+    ap_entry = ""
+    m = re.search(r"(?:subject address listed by AP|subject on air) at start:\s*(\S+)", text)
+    if m: ap_entry = m.group(1)
+    pk, nf = packets_for(run)
+
+    # A verdict the packet count contradicts must never be shown on its own.
+    # Run 181819Z captured nothing in all four windows and reported "startup
+    # looks REPRODUCIBLE" - the tool compared two empty sets and found them
+    # equal. That log still says so, correctly, because logs are append-only.
+    # The viewer is where the contradiction gets surfaced instead of repeated.
+    contradiction = ""
+    if nf and pk == 0 and verdict in ("REPRODUCIBLE", "DIFFER"):
+        contradiction = ("this run captured NOTHING - the verdict above compared "
+                         "two empty sets. See EVIDENCE-INDEX.md section 5.")
+
+    tool = ("robot-listen" if "robot-listen" in run.name else
+            "robot-round-up" if "round-up" in run.name else
+            "robot-roll-call" if "roll-call" in run.name else "?")
+    return {"dir": run, "when": run.name[:17], "tool": tool, "subject": subject,
+            "verdict": verdict, "vcol": vcol, "vwhy": vwhy, "packets": pk,
+            "files": nf, "ap_entry": ap_entry, "doc": doc,
+            "contradiction": contradiction}
+
+def all_runs():
+    if not SCANS.exists(): return []
+    return [run_facts(d) for d in sorted(SCANS.iterdir()) if d.is_dir()]
+
+# ---------------------------------------------------------------- paging
+def show(text, title=""):
+    text = redact(text)
+    lines = text.splitlines()
+    if tty() and len(lines) > shutil.get_terminal_size((100, 30)).lines - 4:
+        pager = os.environ.get("PAGER", "less")
+        try:
+            subprocess.run([pager, "-R", "-F", "-X"] if "less" in pager else [pager],
+                           input=text, text=True)
+            return
+        except Exception:
+            pass
+    if title: head(title)
+    print(text)
+
+def ask(prompt="  pick a number (enter to go back): "):
+    try:
+        return input(f"\n{B}{prompt}{X}").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(); return ""
+
+# ---------------------------------------------------------------- views
+def list_runs(runs):
+    head(f"CAPTURE RUNS  ({len(runs)})")
+    banner()
+    print()
+    print(f"  {D}{'#':>3}  {'when (UTC)':<18}{'tool':<16}{'subject':<13}"
+          f"{'packets':>8}  verdict{X}")
+    hr()
+    for i, r in enumerate(runs, 1):
+        pk = f"{r['packets']:,}" if r["files"] else "—"
+        pkc = R_ if r["packets"] == 0 else ""
+        v = f"{r['vcol']}{r['verdict']}{X}" if r["verdict"] else f"{D}—{X}"
+        if r["contradiction"]: v = f"{R_}{B}{r['verdict']} ⚠ CONTRADICTED{X}"
+        print(f"  {i:>3}  {r['when']:<18}{r['tool']:<16}{r['subject'][:12]:<13}"
+              f"{pkc}{pk:>8}{X}  {v}")
+    hr()
+    zero = sum(1 for r in runs if r["files"] and r["packets"] == 0)
+    print(f"  {D}{zero} of {len(runs)} runs recorded nothing. That is normal - read the "
+          f"verdict before the count.{X}")
+
+def run_menu(r):
+    while True:
+        head(f"{r['tool']}  ·  {r['subject']}  ·  {r['when']}")
+        banner()
+        print()
+        if r["verdict"]:
+            print(f"  verdict   {r['vcol']}{B}{r['verdict']}{X}  {D}{r['vwhy']}{X}")
+        if r["contradiction"]:
+            print()
+            print(f"  {R_}{B}  ⚠  DO NOT READ THE VERDICT ABOVE AS A RESULT.{X}")
+            print(f"  {R_}     {r['contradiction']}{X}")
+        print(f"  packets   {r['packets']:,} across {r['files']} capture file(s)")
+        if r["ap_entry"]:
+            print(f"  AP entry  {r['ap_entry']}  {D}(at start; not proof of power){X}")
+        print(f"  folder    {D}{r['dir']}{X}")
+        print()
+        opts = []
+        if r["doc"]: opts.append(("the log / timeline", lambda: show(r["doc"].read_text(errors='replace'))))
+        caps = sorted(r["dir"].glob("*.pcap")) + sorted(r["dir"].glob("*.pcapng"))
+        if caps: opts.append((f"capture files ({len(caps)})", lambda: pcap_view(r, caps)))
+        zs = sorted([d for d in r["dir"].iterdir() if d.is_dir() and d.name.startswith("zeek")])
+        if zs: opts.append((f"zeek analysis ({len(zs)})", lambda: zeek_view(zs)))
+        errs = r["dir"]/"capture-errors.txt"
+        if errs.exists(): opts.append(("capture errors", lambda: show(errs.read_text(errors='replace'))))
+        opts.append(("open the folder in a file manager", lambda: open_dir(r["dir"])))
+        for i, (lab, _) in enumerate(opts, 1): print(f"   {B}{i}{X}  {lab}")
+        a = ask()
+        if not a: return
+        if a.isdigit() and 1 <= int(a) <= len(opts): opts[int(a)-1][1]()
+
+def pcap_view(r, caps):
+    head("CAPTURE FILES")
+    print()
+    print(f"  {D}{'#':>3}  {'file':<22}{'packets':>9}{'bytes':>11}  first packet (UTC){X}")
+    hr()
+    for i, c in enumerate(caps, 1):
+        key = str(c.relative_to(ROOT))
+        m = MAN.get(key, {})
+        pk = m.get("packets", "?")
+        col = R_ if pk == "0" else ""
+        print(f"  {i:>3}  {c.name:<22}{col}{pk:>9}{X}{int(m.get('bytes',0)):>11,}  "
+              f"{D}{m.get('first','—')}{X}")
+    hr()
+    print(f"  {D}A capture that ran and saw nothing is 24 bytes - the header alone.{X}")
+    a = ask("  number to summarise with tshark (enter to go back): ")
+    if a.isdigit() and 1 <= int(a) <= len(caps):
+        c = caps[int(a)-1]
+        if not shutil.which("tshark"):
+            print(f"  {Y}tshark is not installed.{X}"); ask("  enter to continue: "); return
+        out = subprocess.run(["tshark","-r",str(c),"-T","fields","-e","frame.number",
+                              "-e","eth.src","-e","eth.dst","-e","_ws.col.Protocol",
+                              "-e","_ws.col.Info"], capture_output=True, text=True).stdout
+        if not out.strip(): out = "(no packets in this file)\n"
+        show(out, f"{c.name} - every packet, with direction")
+
+def zeek_view(zs):
+    while True:
+        head("ZEEK ANALYSIS")
+        for i, z in enumerate(zs, 1):
+            logs = sorted(p.name for p in z.glob("*.log"))
+            print(f"   {B}{i}{X}  {z.name:<16}{D}{', '.join(logs) or 'no logs'}{X}")
+        a = ask()
+        if not a: return
+        if not (a.isdigit() and 1 <= int(a) <= len(zs)): continue
+        z = zs[int(a)-1]
+        logs = sorted(z.glob("*.log"))
+        head(z.name)
+        for i, l in enumerate(logs, 1):
+            n = max(0, sum(1 for ln in l.read_text(errors="replace").splitlines()
+                           if ln and not ln.startswith("#")))
+            print(f"   {B}{i}{X}  {l.name:<20}{D}{n} records{X}")
+        b = ask()
+        if b.isdigit() and 1 <= int(b) <= len(logs): zeek_table(logs[int(b)-1])
+
+def zeek_table(log):
+    """Render a Zeek TSV by FIELD NAME. Never by column number - a Zeek upgrade
+    reorders columns and position-based code fails silently when it does."""
+    fields, rows = None, []
+    for line in log.read_text(errors="replace").splitlines():
+        if line.startswith("#fields"):
+            fields = line.split("\t")[1:]; continue
+        if line.startswith("#") or not line.strip(): continue
+        rows.append(line.split("\t"))
+    if not fields or not rows:
+        show(f"({log.name} has no records)", log.name); return
+    want = {"dns.log":  ["ts","query","qtype_name","answers"],
+            "conn.log": ["ts","id.resp_h","id.resp_p","proto","service","orig_bytes","resp_bytes"],
+            "ssl.log":  ["ts","server_name","validation_status"],
+            "dhcp.log": ["ts","client_addr","lease_time","host_name"],
+            "ntp.log":  ["ts","id.resp_h","version"]}.get(log.name)
+    idx = [fields.index(f) for f in (want or fields) if f in fields] or list(range(len(fields)))
+    names = [fields[i] for i in idx]
+
+    # Zeek writes ts as a Unix epoch float. Nobody reads that off a screen, so
+    # render it as UTC clock time - the same clock the operator marks are on,
+    # which is the whole point of being able to line the two up.
+    tsi = idx.index(fields.index("ts")) if "ts" in fields and fields.index("ts") in idx else -1
+    if tsi >= 0:
+        import datetime as _dt
+        for r in rows:
+            j = idx[tsi]
+            if j < len(r):
+                try:
+                    r[j] = _dt.datetime.fromtimestamp(
+                        float(r[j]), _dt.timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                except (ValueError, OSError, OverflowError):
+                    pass
+        names[tsi] = "time (UTC)"
+    widths = [max(len(n), *(len(r[i]) if i < len(r) else 0 for r in rows[:400]))
+              for n, i in zip(names, idx)]
+    widths = [min(w, 44) for w in widths]
+    out = ["  " + "  ".join(n[:w].ljust(w) for n, w in zip(names, widths)),
+           "  " + "  ".join("-"*w for w in widths)]
+    for r in rows:
+        out.append("  " + "  ".join((r[i] if i < len(r) else "")[:w].ljust(w)
+                                    for i, w in zip(idx, widths)))
+    out.append("")
+    out.append(f"  {len(rows)} records · fields read by NAME from the #fields header")
+    show("\n".join(out), f"{log.name}  ({log.parent.name})")
+
+def open_dir(p):
+    for cmd in (["xdg-open", str(p)], ["nautilus", str(p)]):
+        if shutil.which(cmd[0]):
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"  opened {p}"); return
+    print(f"  {p}")
+
+def docs_list():
+    out = []
+    for base, tag in ((GA, "GA"), (SHARE, "share")):
+        if not base.exists(): continue
+        for p in sorted(base.rglob("*")):
+            if p.suffix.lower() in (".md", ".txt") and p.is_file():
+                out.append((tag, p))
+    for p in (ROOT/"EVIDENCE-INDEX.md", MANIFEST):
+        if p.exists(): out.insert(0, ("GA", p))
+    return out
+
+def list_docs(docs, title):
+    head(title)
+    banner(); print()
+    for i, (tag, p) in enumerate(docs, 1):
+        try:    rel = p.relative_to(ROOT)
+        except ValueError: rel = p.relative_to(SHARE.parent)
+        n = sum(1 for _ in p.open(errors="replace"))
+        col = Y if tag == "GA" else G
+        print(f"   {B}{i:>3}{X}  {col}{tag:<6}{X}{str(rel):<54}{D}{n:>5} lines{X}")
+    hr()
+
+def find(term):
+    head(f'SEARCH: "{term}"')
+    banner(); print()
+    hits = 0
+    targets = [p for _, p in docs_list()]
+    targets += [d for d in SCANS.rglob("00-*.txt")] if SCANS.exists() else []
+    for p in targets:
+        try: lines = p.read_text(errors="replace").splitlines()
+        except Exception: continue
+        for n, line in enumerate(lines, 1):
+            if term.lower() in line.lower():
+                hits += 1
+                if hits > 60:
+                    print(f"\n  {Y}…more than 60 matches. Narrow the search.{X}"); return
+                try:    rel = p.relative_to(ROOT)
+                except ValueError: rel = p.name
+                snip = redact(line.strip())[:W()-34]
+                print(f"  {C}{str(rel)[:30]:<30}{X}{D}:{n:<5}{X} {snip}")
+    if not hits: print(f"  {D}no matches.{X}")
+    print()
+
+# ---------------------------------------------------------------- main menu
+def main():
+    if any(a in ("-h", "--help", "help") for a in sys.argv[1:]):
+        print(__doc__); return 0
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if args and args[0] == "find":
+        if len(args) < 2: print("  robot-show find <text>"); return 2
+        find(" ".join(args[1:])); return 0
+
+    start = args[0] if args else None
+    while True:
+        runs = all_runs()
+        if start == "runs" or (start is None and False): pass
+        if start in ("runs", "logs", "docs"):
+            choice = {"runs": "1", "logs": "2", "docs": "2"}[start]; start = None
+        else:
+            head("ROBOLAB EVIDENCE")
+            banner()
+            print()
+            print(f"   {B}1{X}  capture runs          {D}{len(runs)} runs, "
+                  f"{sum(r['packets'] for r in runs):,} packets{X}")
+            print(f"   {B}2{X}  logs and documents    {D}{len(docs_list())} files{X}")
+            print(f"   {B}3{X}  search everything")
+            print(f"   {B}4{X}  the evidence index    {D}claims, and the file that proves each{X}")
+            print(f"\n   {D}q to quit{X}")
+            choice = ask("  pick: ")
+        if choice in ("q", "quit", "exit", ""): print(); return 0
+
+        if choice == "1":
+            while True:
+                runs = all_runs()
+                if not runs:
+                    print(f"\n  {Y}No runs found under {SCANS}{X}"); ask("  enter: "); break
+                list_runs(runs)
+                a = ask()
+                if not a: break
+                if a.isdigit() and 1 <= int(a) <= len(runs): run_menu(runs[int(a)-1])
+        elif choice == "2":
+            while True:
+                docs = docs_list()
+                if not docs:
+                    print(f"\n  {Y}No documents found.{X}"); ask("  enter: "); break
+                list_docs(docs, f"LOGS AND DOCUMENTS ({len(docs)})")
+                a = ask()
+                if not a: break
+                if a.isdigit() and 1 <= int(a) <= len(docs):
+                    p = docs[int(a)-1][1]
+                    show(p.read_text(errors="replace"), str(p.name))
+        elif choice == "3":
+            t = ask("  search for: ")
+            if t: find(t); ask("  enter to continue: ")
+        elif choice == "4":
+            p = ROOT/"EVIDENCE-INDEX.md"
+            if p.exists(): show(p.read_text(errors="replace"), "EVIDENCE INDEX")
+            else: print(f"  {Y}EVIDENCE-INDEX.md not found.{X}"); ask("  enter: ")
+
+if __name__ == "__main__":
+    try: sys.exit(main() or 0)
+    except KeyboardInterrupt: print(); sys.exit(130)

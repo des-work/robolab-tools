@@ -1,0 +1,560 @@
+#!/usr/bin/env bash
+# robot-roll-call — identify every robot on the lab wifi by watching them arrive.
+#
+#   robot-roll-call              the walkthrough  (on the PATH)
+#   robot-roll-call --dry-run    show what it would do, contact nothing
+#
+# THIS SCRIPT DOES NOT POWER ROBOTS AND DOES NOT TELL ANYONE HOW TO.
+# Powering a G1 is a five-phase procedure with a mandatory safety gate, run
+# from the gantry. See "G1 Operation, Modes & Start-Up" in the onboarding hub.
+# This script waits for the handler to say a robot is up. It never sets the
+# pace for the physical procedure, and it never counts down at anyone.
+#
+# It reads the access point's own station table and diffs consecutive reads.
+# An address newly listed after one robot powers up is a candidate attribution;
+# controlled power-down can confirm it once any stale entry has cleared.
+#
+# It NEVER scans. Management queries use authorized SSH connections. Every fact comes from
+# equipment we administer, reporting on itself.
+
+set -uo pipefail
+TOOLDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+AP_MAC_PREFIX="${AP_MAC_PREFIX:-94:83:c4}"
+OUTDIR="${OUTDIR:-$HOME/Documents/robolab-evidence/scans}"
+DRY=0
+[ "${1:-}" = "--dry-run" ] && DRY=1
+
+stamp() { date -u +%Y-%m-%dT%H%M%SZ; }
+iso()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
+say()   { printf '%s\n' "$*"; }
+hr()    { printf '%s\n' "════════════════════════════════════════════════════════════"; }
+sub()   { printf '%s\n' "────────────────────────────────────────────────────────────"; }
+# An unchecked `read` here is a safety problem, not a style one. On EOF read
+# returns immediately, so every pause in the procedure fires at once and the
+# script runs the whole G1 sequence with nobody at the gantry. A pause that
+# cannot wait must stop the run.
+pause() {
+    printf '\n    %s ' "${1:-Press enter to continue.}"
+    if ! read -r _; then
+        printf '\n\n    Input ended at a pause. This procedure requires a person\n'
+        printf '    at each step, so nothing further will run.\n\n'
+        exit 2
+    fi
+}
+
+OUT="$OUTDIR/$(stamp)-robot-roll-call.txt"
+log() { printf '%s\n' "$*" >> "$OUT"; }
+
+# ═════════════════════════════════════════════════════ 0 · Before you start
+
+clear 2>/dev/null || true
+hr
+say "  ROBOT ROLL CALL"
+say "  Which robot is which on the lab wifi — by observation, not inference"
+hr
+say ""
+say "  ⚠  THIS SCRIPT DOES NOT POWER ROBOTS."
+say ""
+say "     Powering a G1 is a five-phase procedure run from the gantry, with a"
+say "     mandatory zero-torque safety gate. It is documented separately, in"
+say "     'G1 Operation, Modes & Start-Up'. Follow that, not this."
+say ""
+say "     This script only reads the access point between robots. It waits for"
+say "     you. It will never rush you and it has no timer."
+say ""
+say "  WHAT THIS NEEDS FROM THE ROBOT — and it is less than you think:"
+say ""
+say "     Only that it is POWERED. Its wifi associates shortly after power-on,"
+say "     long before the ready state. You do NOT need to bring it to"
+say "     operational control, and you do NOT need to take it out of the"
+say "     gantry. Leave it suspended."
+say ""
+say "  PEOPLE — three roles, and the scribe should not also be driving:"
+say ""
+say "     OPERATOR   at this keyboard. Runs this. Touches no robot."
+say "     HANDLER    at the gantry. Runs the G1 start-up procedure. Says"
+say "                'up' out loud when a robot is powered and stable."
+say "     SCRIBE     labels each robot as it is identified. Notes surprises."
+say ""
+pause "Read the above. Press enter when all three roles are filled."
+
+# ═════════════════════════════════════════════════════ pre-flight
+
+clear 2>/dev/null || true
+hr
+say "  PHASE 0 — PRE-FLIGHT (no robot involved)"
+hr
+say ""
+
+SSIDNOW=$(nmcli -t -f NAME connection show --active 2>/dev/null | head -1)
+MYIP=$(ip -4 -br address show scope global 2>/dev/null | awk '{print $3}' | head -1)
+say "    network   ${SSIDNOW:-none}"
+say "    address   ${MYIP:-none}"
+
+if ! python3 "$TOOLDIR/rl_network.py" "$MYIP"; then
+    say ""
+    say "    ✗ NOT ON THE LAB SEGMENT. Set RL_LAB_NETWORK to the authorized lab CIDR."
+    say "      Join the configured lab network first. Nothing below is valid off it."
+    [ "$DRY" -eq 0 ] && exit 2
+    say "      (--dry-run: continuing)"
+fi
+
+AP=""
+if [ "$DRY" -eq 0 ]; then
+    AP=$(ip neighbor show 2>/dev/null | grep -i "$AP_MAC_PREFIX" | awk '{print $1}' | head -1)
+fi
+
+# Host key before anything tries to authenticate - see ap-hostkey for why.
+if [ -n "${AP:-}" ]; then
+    HK="$(dirname "$0")/ap-hostkey"
+    if [ -x "$HK" ]; then
+        HKRC=0; "$HK" "$AP" || HKRC=$?
+        [ "$HKRC" = "4" ] && AP=""   # refused: unknown device on that address
+    fi
+fi
+if [ -z "$AP" ]; then
+    say ""
+    say "    ✗ Access point not in the neighbour cache."
+    say "      Open its admin page once, then re-run."
+    say "      It moves. Never type a remembered address."
+    [ "$DRY" -eq 0 ] && exit 2
+    AP="<ap>"
+fi
+say "    access point   $AP   (found by hardware address, not assumed)"
+
+[ -z "${RL_OPERATOR:-}" ] && {
+  say ""
+  say "    ⚠  RL_OPERATOR is not set. On a shared account this record cannot"
+  say "       say who ran it.   export RL_OPERATOR=<yourname>"
+}
+say ""
+pause "Pre-flight read. Press enter."
+
+# ═════════════════════════════════════════════════════ snapshot plumbing
+
+snapshot() {
+    if [ "$DRY" -eq 1 ]; then printf 'dry-run-no-data\n'; return 0; fi
+    local out rc
+    out=$(ssh -n -o BatchMode=yes -o ConnectTimeout=8 "root@$AP" '
+        echo "__RC_OK__"
+        for i in $(iw dev 2>/dev/null | awk "/Interface/{print \$2}"); do
+            iw dev "$i" station dump 2>/dev/null \
+              | awk -v ifc="$i" "/^Station/{print \$2\"\t\"ifc}"
+        done
+    ' 2>/dev/null)
+    rc=$?
+    { [ $rc -ne 0 ] || ! printf '%s' "$out" | grep -q '__RC_OK__'; } && return 1
+    printf '%s' "$out" | grep -v '__RC_OK__' | sort -u
+    return 0
+}
+
+# ── accuracy helpers ────────────────────────────────────────────────────────
+#
+# The diff runs on the HARDWARE ADDRESS ALONE, lowercased.
+#
+# It used to diff "mac<TAB>interface", which produced a FALSE ARRIVAL whenever a
+# device roamed between the 2.4 and 5 GHz radios — the old line vanished and a
+# new one appeared, and the script reported someone's phone as the robot you
+# had just powered. In a dual-band room phones roam constantly. Diffing on the
+# address alone removes that entirely, and removes a case-change false positive
+# with it.
+
+macs_of() { printf '%s\n' "$1" | awk -F'\t' 'NF{print tolower($1)}' | sort -u; }
+
+iface_of() {   # iface_of <mac> <table>
+    printf '%s\n' "$2" | awk -F'\t' -v m="$1" 'tolower($1)==m{print $2; exit}'
+}
+
+# A locally-administered address (bit 1 of the first octet) is a randomised one.
+# Phones and privacy-conscious laptops use them. A robot on factory firmware
+# almost never does — so this is a cheap, strong "that is probably not a robot".
+report_arrivals() {
+    # $1 robot number   $2 newline-separated MACs   $3 current table   $4 which read
+    local n="$1" new="$2" now="$3" whence="$4" n_new m ifc
+    n_new=$(printf '%s' "$new" | grep -c . || true)
+
+    if [ "$n_new" -gt 1 ]; then
+        say "    ⚠  $n_new DEVICES ARRIVED AT ONCE — ambiguous ($whence)"
+        say ""
+        say "    Only one robot was powered, so at least one of these is"
+        say "    something else joining the room. DO NOT attribute blindly."
+        say "    Resolve it by powering THIS robot down alone and re-reading."
+        log "   WARNING: $n_new devices arrived between reads ($whence). Only one"
+        log "   robot was powered, so this attribution is AMBIGUOUS."
+        log "   Resolve by controlled power-down, not by guessing."
+    else
+        say "    ─ ROBOT $n — CANDIDATE IDENTIFIED ($whence) ─"
+        say "      Candidate, not confirmed. Phase 4 confirms it."
+        log "   NEW ARRIVAL — robot $n candidate, by observation ($whence):"
+    fi
+    say ""
+
+    for m in $new; do
+        ifc=$(iface_of "$m" "$now")
+        if is_randomised "$m"; then
+            say "        $m  on ${ifc:-?}   ⚠ RANDOMISED ADDRESS"
+            say "          Locally-administered — a phone or privacy-enabled"
+            say "          laptop. A robot on factory firmware rarely is."
+            log "   $m on ${ifc:-?}  — RANDOMISED (locally-administered) address."
+            log "     Almost certainly not a robot. Treat with suspicion."
+        else
+            say "        $m  on ${ifc:-?}   vendor prefix $(vendor_prefix "$m")"
+            log "   $m on ${ifc:-?}  vendor prefix $(vendor_prefix "$m")"
+        fi
+    done
+
+    say ""
+    say "    Absent before, present now — by observation, not guessed"
+    say "    from a vendor prefix."
+}
+
+is_randomised() {
+    local b1
+    b1=$(printf '%s' "$1" | cut -d: -f1)
+    [ $(( 0x$b1 & 2 )) -ne 0 ]
+}
+
+vendor_prefix() { printf '%s' "$1" | cut -d: -f1-3; }
+
+# An `exit` inside $( ) kills only the subshell, so the guard runs in the parent.
+read_failed() {
+    say ""
+    say "    ✗ COULD NOT READ THE ACCESS POINT."
+    say "      This is NOT 'the robot did not appear' — we simply do not know."
+    say "      Check SSH to $AP, then re-run."
+    log "## READ FAILED at $(iso) — access point unreachable. No conclusion"
+    log "   about any robot can be drawn from this point onward."
+    exit 3
+}
+
+mkdir -p "$OUTDIR"
+{
+  echo "# RoboLab — robot roll call"
+  echo "# run at:    $(iso)"
+  echo "# operator:  ${RL_OPERATOR:-UNDECLARED}"
+  echo "# host:      $(hostname) @ ${MYIP:-unknown}"
+  echo "# ap:        $AP  (located by hardware address prefix $AP_MAC_PREFIX)"
+  echo "# method:    compare AP station-table reads around power changes."
+  echo "#            No scan. Nothing sent to any client. A new entry is"
+  echo "#            a candidate until a controlled departure confirms it."
+  echo "# physical:  robots powered per the G1 start-up procedure, by the"
+  echo "#            handler, at the handler's pace. Not by this script."
+  echo ""
+} > "$OUT"
+
+# ═════════════════════════════════════════════════════ 1 · Baseline
+
+clear 2>/dev/null || true
+hr
+say "  PHASE 1 — BASELINE, every robot still OFF"
+hr
+say ""
+say "    Why this comes first: a robot already powered at baseline is"
+say "    INVISIBLE to this whole method. A lingering AP station entry can"
+say "    also be present after shutdown. Baseline entries are unidentified"
+say "    until a controlled change establishes which device they belong to."
+say ""
+say "    Handler: confirm out loud that every robot is powered down."
+say ""
+pause "Press enter when the handler has confirmed."
+
+if ! BEFORE=$(snapshot); then read_failed; fi
+N_BEFORE=$(printf '%s' "$BEFORE" | grep -c . || true)
+
+log "## baseline — all robots off — $(iso)"
+log "$BEFORE"
+log ""
+log "   $N_BEFORE address(es) listed in the AP station table at baseline."
+log "   Identity and power state are unknown from this read alone. Entries"
+log "   can linger after shutdown; no baseline entry is attributed."
+log ""
+
+say ""
+say "    $N_BEFORE address(es) already listed by the AP."
+say "    This may include stale entries from powered-down devices. The"
+say "    baseline cannot identify or confirm any of them by itself."
+say ""
+pause
+
+# ═════════════════════════════════════════════════════ 2 · One at a time
+
+COUNT=""
+# Bounded, and EOF-checked: an unchecked read in a validation loop spins at
+# full speed forever when stdin closes. The same defect was in robot-round-up's
+# address prompt and was found by piping input to --dry-run.
+COUNT_TRIES=0
+while ! printf '%s' "$COUNT" | grep -qE '^[0-9]+$'; do
+    COUNT_TRIES=$((COUNT_TRIES+1))
+    if [ "$COUNT_TRIES" -gt 5 ]; then
+        say ""; say "    Five attempts, no valid number. Nothing was started."; exit 2
+    fi
+    printf '\n    How many robots will you power up? '
+    read -r COUNT || { say ""; say "    Input ended. Nothing was started."; exit 2; }
+    printf '%s' "$COUNT" | grep -qE '^[1-9][0-9]*$' || say "    A whole number, 1 or more."
+done
+
+PREV="$BEFORE"
+for n in $(seq 1 "$COUNT"); do
+    clear 2>/dev/null || true
+    hr
+    say "  PHASE 2 — ROBOT $n OF $COUNT"
+    hr
+    say ""
+    say "    BEFORE ANYONE TOUCHES ROBOT $n — serialisation gate."
+    say ""
+    say "    A G1 radio associates DURING the start-up procedure, not at the"
+    say "    end of it. If any other robot's procedure has already begun, its"
+    say "    radio may join inside THIS robot's window and be credited here."
+    say "    That produced a confident wrong answer on 2026-09-29."
+    say ""
+    OK=""
+    while [ "$OK" != "y" ]; do
+        printf '    Confirm with the handler: has NO other robot been started,\n'
+        printf '    touched, or part-way through a procedure? [y/N] '
+        if ! read -r OK; then say ""; say "    Input ended. Nothing further will run."; exit 2; fi
+        OK=${OK:-n}
+        [ "$OK" = "y" ] || say "    Wait until that is true. Nothing else is worth reading."
+    done
+
+    # Re-snapshot immediately before the procedure begins. Anything that
+    # drifted in since the last read belongs to NOBODY, and is recorded as
+    # such rather than silently credited to this robot.
+    if ! PRE=$(snapshot); then read_failed; fi
+    DRIFT=$(comm -13 <(macs_of "$PREV") <(macs_of "$PRE"))
+    if [ -n "$DRIFT" ]; then
+        say ""
+        say "    ⚠  DRIFT — device(s) joined between robots, with nothing powered:"
+        printf '%s\n' "$DRIFT" | sed 's/^/        /'
+        say "    NOT attributable to robot $n. Recorded as unattributed."
+        log "## drift before robot $n — $(iso)"
+        log "   joined with no robot procedure running. NOT attributable:"
+        log "$DRIFT"
+        log ""
+    fi
+    PREV="$PRE"
+    T_START=$(iso)
+    log "## robot $n — procedure began at $T_START (radio may join from here)"
+
+    say ""
+    say "    HANDLER: power up robot $n, following the G1 start-up procedure."
+    say "             Leave every other robot OFF."
+    say "             Leave it in the gantry. It does not need to stand."
+    say ""
+    say "    There is no timer. Take as long as the procedure takes."
+    say "    Say 'up' when it is powered and stable."
+    say ""
+    pause "OPERATOR: press enter only after the handler says 'up'."
+
+    T_ON=$(iso)
+    say ""
+    printf '    Reading the access point'
+    if [ "$DRY" -eq 0 ]; then for _ in 1 2 3; do printf '.'; sleep 1; done; fi
+    say ""
+
+    if ! NOW=$(snapshot); then read_failed; fi
+    NEW=$(comm -13 <(macs_of "$PREV") <(macs_of "$NOW"))
+
+    log "## robot $n — handler confirmed up at $T_ON — read at $(iso)"
+    say ""
+    if [ -z "$NEW" ]; then
+        say "    ─ NOTHING NEW APPEARED ─"
+        say ""
+        say "    A real result, not a failure. In order of likelihood:"
+        say "      1. it is still associating — wait and re-read (option below)"
+        say "      2. it does not join this network at all"
+        say "      3. it is not using wifi for anything"
+        log "   NO NEW AP STATION ENTRY APPEARED."
+        log "   This does not establish whether the robot is off, joined"
+        log "   before the baseline, or has a lingering station entry."
+        say ""
+        printf '    Wait 45s and read again? [y/N] '
+        if ! read -r AGAIN; then say ""; say "    Input ended. Nothing further will run."; exit 2; fi
+        if [ "${AGAIN:-n}" = "y" ]; then
+            [ "$DRY" -eq 0 ] && sleep 45
+            if ! NOW=$(snapshot); then read_failed; fi
+            NEW=$(comm -13 <(macs_of "$PREV") <(macs_of "$NOW"))
+            log "   re-read at $(iso):"
+            if [ -z "$NEW" ]; then
+                say "    Still nothing. Recorded."
+                log "   still nothing new."
+            else
+                report_arrivals "$n" "$NEW" "$NOW" "re-read"
+            fi
+        fi
+    else
+        report_arrivals "$n" "$NEW" "$NOW" "first read"
+    fi
+    log ""
+
+    printf '\n    SCRIBE — label for robot %s (e.g. G1-A, or a serial): ' "$n"
+    if ! read -r LABEL; then say ""; say "    Input ended. Nothing further will run."; exit 2; fi
+    log "   operator label for robot $n: ${LABEL:-none given}"
+    log ""
+
+    PREV="$NOW"
+done
+
+# ═════════════════════════════════════════════════════ 3 · All on
+
+clear 2>/dev/null || true
+hr
+say "  PHASE 3 — ALL ROBOTS UP"
+hr
+say ""
+say "    Final table, with everything powered."
+say ""
+pause "Press enter when all $COUNT are up and stable."
+
+if ! FINAL=$(snapshot); then read_failed; fi
+log "## all robots up — $(iso)"
+log "$FINAL"
+log ""
+
+ROBOTS=$(comm -13 <(macs_of "$BEFORE") <(macs_of "$FINAL"))
+N_ROBOTS=$(printf '%s' "$ROBOTS" | grep -c . || true)
+
+log "## attributed — present now, absent at baseline"
+log "$ROBOTS"
+log ""
+log "   $N_ROBOTS new AP station entry/entries appeared during this run."
+log "   Each is a candidate until a controlled change confirms attribution."
+log ""
+log "## what this record does NOT establish"
+log "   - how any of them obtained its address  (see phase 4)"
+log "   - what any of them is doing             (see phase 4)"
+log "   - the identity or power state of baseline entries"
+log "   - that a missing entry proves a robot is off"
+log ""
+
+say ""
+say "    $N_ROBOTS device(s) arrived during this run."
+printf '%s\n' "$ROBOTS" | sed 's/^/        /'
+say ""
+
+# ═════════════════════════════════════ 4 · Confirm by controlled power-down
+
+clear 2>/dev/null || true
+hr
+say "  PHASE 4 — CONFIRM BY POWER-DOWN"
+hr
+say ""
+say "    Everything above is a CANDIDATE. Arrivals suggest; departures prove."
+say ""
+say "    An arrival can coincide with an unrelated device joining, or with"
+say "    another robot's radio coming up early. A departure under a single"
+say "    controlled change cannot be explained either of those ways."
+say ""
+say "    Power down ONE robot at a time and confirm which address leaves."
+say ""
+
+log "## phase 4 — confirmation by controlled power-down"
+log ""
+
+CONFIRMED=""
+PREV="$FINAL"
+for n in $(seq 1 "$COUNT"); do
+    say ""
+    printf '    Confirm robot %s by powering it down alone? [Y/n] ' "$n"
+    if ! read -r DOIT; then say ""; say "    Input ended. Nothing further will run."; exit 2; fi
+    if [ "${DOIT:-y}" != "y" ]; then
+        log "   robot $n — power-down confirmation SKIPPED by operator."
+        log "   Its attribution stays a candidate, not a confirmed mapping."
+        say "    Skipped. Robot $n stays a CANDIDATE in the record."
+        continue
+    fi
+
+    say ""
+    say "    HANDLER: power down robot $n only. Leave the others up."
+    say "             Follow the shutdown procedure. There is no timer."
+    say ""
+    pause "OPERATOR: press enter once robot $n is fully down."
+
+    if ! NOW=$(snapshot); then read_failed; fi
+    GONE=$(comm -23 <(macs_of "$PREV") <(macs_of "$NOW"))
+    N_GONE=$(printf '%s' "$GONE" | grep -c . || true)
+
+    log "## robot $n powered down alone — read at $(iso)"
+    if [ "$N_GONE" -eq 1 ]; then
+        say ""
+        say "    ─ CONFIRMED — robot $n is $GONE ─"
+        log "   CONFIRMED: robot $n = $GONE"
+        log "   Single device departed under a single controlled change."
+        CONFIRMED="$CONFIRMED$n	$GONE
+"
+    elif [ "$N_GONE" -eq 0 ]; then
+        say ""
+        say "    ⚠  NOTHING LEFT THE ACCESS POINT."
+        say "       Either its radio stays up after shutdown, or it was never"
+        say "       associated, or the station entry has not aged out yet."
+        say "       Wait 60s and re-read before concluding anything."
+        log "   NOTHING DEPARTED. Not a confirmation and not a refutation."
+        log "   Station entries can lag a shutdown. Re-read before concluding."
+    else
+        say ""
+        say "    ⚠  $N_GONE DEVICES LEFT AT ONCE — ambiguous:"
+        printf '%s\n' "$GONE" | sed 's/^/        /'
+        say "       Robot $n may present more than one radio, or something"
+        say "       unrelated left in the same window. Not a confirmation."
+        log "   WARNING: $N_GONE devices departed. AMBIGUOUS, not confirmed:"
+        log "$GONE"
+    fi
+    log ""
+    PREV="$NOW"
+done
+
+log "## confirmed mappings (robot number, hardware address)"
+if [ -n "$CONFIRMED" ]; then
+    printf '%s' "$CONFIRMED" | sed 's/^/   robot /' >> "$OUT"
+else
+    log "   none — no robot was confirmed by controlled power-down."
+    log "   Every mapping in this record is a candidate only."
+fi
+log ""
+
+# ═════════════════════════════════════════════════════ 5 · What next
+
+hr
+say "  PHASE 5 — WHAT THIS UNLOCKS"
+hr
+say ""
+say "    Record written to:"
+say "      $OUT"
+say ""
+sub
+say "    A · HOW DO THEY GET THEIR ADDRESSES?"
+sub
+say "    Power ONE robot down, start this, power it back up:"
+say ""
+say "      ssh root@$AP \"tcpdump -i br-lan -U -s 0 -w - \\"
+say "        'ether host <mac> and (port 67 or port 68)'\" > dhcp-boot.pcap"
+say ""
+say "    port 67/68 is DHCP only — the address negotiation and almost"
+say "    nothing else. About as narrow as a capture gets."
+say ""
+say "      DISCOVER→OFFER→REQUEST→ACK  it is a DHCP client. Closed."
+say "      nothing at all              statically configured. Closed."
+say "      two exchanges in one boot   two DHCP clients on one interface"
+say ""
+say "    Ignore anything on 192.168.123.x — that is the robot's internal"
+say "    wired subnet, static by vendor design, not this question."
+say ""
+sub
+say "    B · WITH EVERYTHING ON, WHAT CAN WE SEE?"
+sub
+say "    Name every robot explicitly. Never widen the filter."
+say ""
+say "      ssh root@$AP \"tcpdump -i br-lan -U -s 0 -w - \\"
+say "        'ether host <mac1> or ether host <mac2>'\" > robots.pcap"
+say ""
+say "      zeek -r robots.pcap"
+say "      zeek-cut id.orig_h id.resp_h service conn_state < conn.log"
+say ""
+say "    The question worth prioritising: DO THEY TALK TO EACH OTHER?"
+say "    Robot-to-robot traffic is visible to us and invisible to campus."
+say ""
+hr
+say "  Both captures need the Part 4 authorization. This roll call did not —"
+say "  it sent nothing to anything."
+hr
+say ""

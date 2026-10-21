@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# ap-hostkey - decide whether the thing answering at an address is the access
+#              point we already trust, before any tool tries to use it.
+#
+#   ap-hostkey <host>
+#
+# WHY THIS EXISTS
+#
+#   The access point is a DHCP client and it MOVES. It was .82 one week and .84
+#   the next. Every tool here finds it by hardware address, so a move is handled
+#   - except for one step nobody handled.
+#
+#   On first contact with a new address, ssh wants to confirm the host key. Every
+#   tool connects with BatchMode=yes, and BatchMode does not ASK the question, it
+#   FAILS it:
+#
+#       Host key verification failed.
+#
+#   which each tool then reports as "cannot SSH to the access point". That reads
+#   as a broken key pair. It is not. The key pair is fine and the address simply
+#   changed - and you can lose a lab session to that misdiagnosis.
+#
+#   The address changes. The host key does not. So:
+#
+#     - already trusted at this address        -> fine, go
+#     - new address, host key we ALREADY trust -> it moved. Record it, go.
+#     - new address, host key we do NOT know   -> STOP. Something else is there.
+#
+#   The last case is the point. On a shared campus segment another device can
+#   end up on the address the AP had, and `StrictHostKeyChecking=no` would
+#   cheerfully hand it our session. This never trusts a key it has not already
+#   seen under some other name.
+#
+# EXIT CODES  (tools branch on these; the text is for the human)
+#   0  trusted at this address, nothing to do
+#   3  it moved - same host key under a new address, now recorded
+#   4  REFUSED - an unrecognised host key. Do not continue.
+#   5  could not reach the host to read its key at all
+#   2  bad usage
+#
+# This reads ONE host's public key, the host we are about to connect to anyway.
+# It is not a scan and it touches nothing else on the segment.
+set -uo pipefail
+
+KH="${HOME}/.ssh/known_hosts"
+host="${1:-}"
+[ -n "$host" ] || { echo "usage: ap-hostkey <host>" >&2; exit 2; }
+
+c(){ [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && printf '%s' "$1" || true; }
+B=$(c $'\033[1m'); D=$(c $'\033[2m'); R=$(c $'\033[31m')
+G=$(c $'\033[32m'); Y=$(c $'\033[33m'); X=$(c $'\033[0m')
+
+# 1 - already trusted at this exact address?
+#
+# -f is not optional. Without it ssh-keygen resolves the home directory from the
+# password database rather than $HOME, so the lookup below and the fingerprint
+# comparison further down can read two DIFFERENT files. They agree in normal use
+# and disagree exactly when you are testing, which is the worst way round.
+if ssh-keygen -F "$host" -f "$KH" >/dev/null 2>&1; then
+    printf '%sok%s    access point host key already trusted at %s\n' "$G" "$X" "$host"
+    exit 0
+fi
+
+# 2 - not known here. Read what is actually answering.
+scan=$(ssh-keyscan -T 8 -H "$host" 2>/dev/null | grep -v '^#')
+if [ -z "$scan" ]; then
+    printf '%sFAIL%s  nothing answered ssh at %s\n' "$R" "$X" "$host"
+    printf '      Either it is not up, or that is not the access point.\n'
+    exit 5
+fi
+
+now_fp=$(printf '%s\n' "$scan" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | sort -u)
+[ -n "$now_fp" ] || { printf '%sFAIL%s  could not read a host key from %s\n' "$R" "$X" "$host"; exit 5; }
+
+known_fp=""
+[ -f "$KH" ] && known_fp=$(ssh-keygen -lf "$KH" 2>/dev/null | awk '{print $2}' | sort -u)
+
+# 3 - do we already trust this key under some other name?
+match=$(comm -12 <(printf '%s\n' "$now_fp") <(printf '%s\n' "${known_fp:-}") 2>/dev/null | head -1)
+
+if [ -n "$match" ]; then
+    # known_hosts is hashed, so the previous ADDRESS cannot be recovered - only
+    # the fact that this key is already trusted. Say exactly that and no more.
+    printf '%s%sthe access point MOVED%s - it is at %s%s%s now.\n' "$Y" "$B" "$X" "$B" "$host" "$X"
+    printf '      Same host key, already trusted under another address.\n'
+    printf '      %s%s%s\n' "$D" "$match" "$X"
+    mkdir -p "$(dirname "$KH")"; touch "$KH"; chmod 600 "$KH"
+    # Preserve only individual key lines whose fingerprints are already trusted.
+    # One matching algorithm must not authorize every other key in the response.
+    while IFS= read -r keyline; do
+        fingerprint=$(printf '%s\n' "$keyline" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')
+        if [ -n "$fingerprint" ] && printf '%s\n' "$known_fp" | grep -Fxq -- "$fingerprint"; then
+            printf '%s\n' "$keyline" >> "$KH"
+        fi
+    done <<< "$scan"
+    printf '%sok%s    recorded. Safe to continue.\n' "$G" "$X"
+    exit 3
+fi
+
+printf '%s%sREFUSED%s - the host key at %s is one we have NEVER seen.\n' "$R" "$B" "$X" "$host"
+printf '      This is NOT the access point we know, or the access point was\n'
+printf '      replaced or reflashed. Something else may be on that address.\n'
+printf '      %sfound:%s %s\n' "$D" "$X" "$(printf '%s\n' "$now_fp" | tr '\n' ' ')"
+printf '\n'
+printf '      Nothing was recorded and nothing should connect. If the access\n'
+printf '      point really was replaced, the GA removes the old entry\n'
+printf '      deliberately:  ssh-keygen -R <old-address>\n'
+exit 4
